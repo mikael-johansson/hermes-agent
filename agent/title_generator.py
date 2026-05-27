@@ -20,9 +20,10 @@ FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
 _TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Generate a short, descriptive title (3-6 words, not exceeding 50 characters) for "
+    "a conversation that starts with the following exchange. The title should capture "
+    "the main topic or intent. Return ONLY the title text, nothing else. No quotes, no "
+    "punctuation at the end, no prefixes."
 )
 
 
@@ -67,9 +68,9 @@ def generate_title(
         title = title.strip('"\'')
         if title.lower().startswith("title:"):
             title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
+        # Enforce reasonable length to avoid truncation in sidebar/TUI/list views.
+        if len(title) > 50:
+            title = title[:47] + "..."
         return title if title else None
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
