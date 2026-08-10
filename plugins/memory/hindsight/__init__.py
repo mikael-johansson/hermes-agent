@@ -553,6 +553,19 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         env_values["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(
             _parse_int_setting(idle_timeout, _DEFAULT_IDLE_TIMEOUT)
         )
+
+    # Pass through any HINDSIGHT_API_EMBEDDINGS_* keys from config
+    # (e.g. HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU) so the daemon sees them
+    for key, value in config.items():
+        if key.startswith("HINDSIGHT_API_EMBEDDINGS_") and value is not None:
+            env_values[key] = str(value)
+
+    # Forward CUDA_VISIBLE_DEVICES if set (required for Maxwell GPUs that
+    # fail with CC < 6.0 — empty string forces PyTorch to see zero GPUs)
+    if config.get("CUDA_VISIBLE_DEVICES") is not None:
+        env_values["CUDA_VISIBLE_DEVICES"] = str(config["CUDA_VISIBLE_DEVICES"])
+
+
     return env_values
 
 
