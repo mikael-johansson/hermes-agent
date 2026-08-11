@@ -565,6 +565,12 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     if config.get("CUDA_VISIBLE_DEVICES") is not None:
         env_values["CUDA_VISIBLE_DEVICES"] = str(config["CUDA_VISIBLE_DEVICES"])
 
+    # Forward llm_extra_body as JSON env var so the daemon merges it into every
+    # API call's extra_body (e.g. {"thinking_budget": 0} to disable oMLX reasoning)
+    extra_body = config.get("llm_extra_body")
+    if extra_body is not None:
+        import json as _json
+        env_values["HINDSIGHT_API_LLM_EXTRA_BODY"] = _json.dumps(extra_body)
 
     return env_values
 
