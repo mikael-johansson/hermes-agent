@@ -554,10 +554,12 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
             _parse_int_setting(idle_timeout, _DEFAULT_IDLE_TIMEOUT)
         )
 
-    # Pass through any HINDSIGHT_API_EMBEDDINGS_* keys from config
-    # (e.g. HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU) so the daemon sees them
+    # Pass through any HINDSIGHT_API_* keys from config (embeddings, LLM
+    # concurrency caps, etc.) so the daemon sees them.  We already handle a few
+    # well-known LLM keys above (provider, model, base_url, api_key) — the loop
+    # covers everything else like HINDSIGHT_API_LLM_MAX_CONCURRENT.
     for key, value in config.items():
-        if key.startswith("HINDSIGHT_API_EMBEDDINGS_") and value is not None:
+        if key.startswith("HINDSIGHT_API_") and value is not None:
             env_values[key] = str(value)
 
     # Forward CUDA_VISIBLE_DEVICES if set (required for Maxwell GPUs that
