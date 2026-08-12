@@ -401,7 +401,12 @@ def generate_title(
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            extra_body={
+                "response_format": _TITLE_RESPONSE_FORMAT,
+                # oMLX uses thinking_budget (not reasoning.enabled) to disable reasoning;
+                # pass it unconditionally — other backends silently ignore unknown fields.
+                "thinking_budget": 0,
+            },
         )
         content = response.choices[0].message.content or ""
         return _clean_title(_extract_title_text(content))
