@@ -1768,6 +1768,7 @@ class ContextCompressor(ContextEngine):
             # applied, so the floor stacks on top of it.
             self.threshold_percent = self._effective_threshold_percent(
                 self._resolved_context_length, self._base_threshold_percent,
+                getattr(self, "small_ctx_floor", True),
             )
             self._emit_init_summary_once()
         return self._resolved_context_length
@@ -1795,7 +1796,7 @@ class ContextCompressor(ContextEngine):
         _base = getattr(self, "_base_threshold_percent", None)
         if _base is not None:
             self.threshold_percent = self._effective_threshold_percent(
-                value, _base,
+                value, _base, getattr(self, "small_ctx_floor", True),
             )
         self._threshold_tokens = None
         self._tail_token_budget = None
@@ -2325,7 +2326,7 @@ class ContextCompressor(ContextEngine):
         )
         self._base_threshold_percent = _new_base
         self.threshold_percent = self._effective_threshold_percent(
-            context_length, _new_base,
+            context_length, _new_base, getattr(self, "small_ctx_floor", True),
         )
         # max_tokens=None here means "caller didn't specify" → keep the existing
         # output reservation. A switch that genuinely changes the output budget
@@ -2455,6 +2456,7 @@ class ContextCompressor(ContextEngine):
     @staticmethod
     def _effective_threshold_percent(
         context_length: int, threshold_percent: float,
+        small_ctx_floor: bool = True,
     ) -> float:
         """Apply the small-context threshold floor (raise-only).
 
@@ -2464,8 +2466,17 @@ class ContextCompressor(ContextEngine):
         e.g. Codex gpt-5.5's 85%) always wins; only lower values are raised.
         Large-context models keep the configured value — at 512K+ the default
         50% trigger already leaves ample post-compaction headroom.
+
+        ``small_ctx_floor=False`` disables the floor entirely (operator opt-out,
+        e.g. ``compression.small_ctx_floor: false``) so a configured sub-75%
+        threshold is honored verbatim on sub-512K windows.  The default
+        (True) preserves the upstream thrash-prevention behavior.
         """
-        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
+        if (
+            small_ctx_floor
+            and context_length
+            and context_length < _SMALL_CTX_WINDOW_LIMIT
+        ):
             return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent
 
@@ -2532,6 +2543,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        small_ctx_floor: bool = True,
     ):
         self.model = model
         self.base_url = base_url
@@ -2590,6 +2602,11 @@ class ContextCompressor(ContextEngine):
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
+        # Operator opt-out for the small-context threshold floor (#60989). When
+        # False, a configured sub-75% threshold is honored verbatim on
+        # sub-512K windows (e.g. local llama.cpp with a 150K window). Default
+        # True preserves the upstream thrash-prevention behavior.
+        self.small_ctx_floor = bool(small_ctx_floor)
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the

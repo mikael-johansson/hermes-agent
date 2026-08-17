@@ -2020,6 +2020,13 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    # Operator opt-out for the small-context threshold floor (#60989).
+    # Default True preserves upstream behavior (sub-512K windows floored at
+    # 75%); set compression.small_ctx_floor: false to honor a configured
+    # sub-75% threshold verbatim (e.g. local llama.cpp with a 150K window).
+    compression_small_ctx_floor = _compression_cfg.get(
+        "small_ctx_floor", True
+    ) not in {False, "false", "False", 0, "0"}
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).
@@ -2547,6 +2554,7 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            small_ctx_floor=compression_small_ctx_floor,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

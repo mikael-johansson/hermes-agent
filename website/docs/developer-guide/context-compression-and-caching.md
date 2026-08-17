@@ -119,6 +119,7 @@ auxiliary:
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
 | `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
 | `codex_responses_compact_threshold` | `200000` | ≥1 tokens | Server-side compaction trigger in input tokens. Clamped below the local compression threshold at request time so the server compacts first |
+| `small_ctx_floor` | `true` | bool | When `true` (default), models with context windows below 512K have their effective threshold floored at `0.75` (raise-only, see "Small-context threshold floor" below). Set `false` to honor a configured `threshold` (or `model_thresholds` override) verbatim — useful for local llama.cpp servers with a 150K window where a 75% trigger fires only after the prompt has already grown past the limit |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
 ### In-place compaction (single stable session id)
@@ -158,7 +159,32 @@ Resolution rules:
 - The **small-context floor still applies on top** of overrides (raise-only):
   models with context windows below 512K are floored at `0.75`, so an
   override below the floor is raised to `0.75`, while an override above it
-  (e.g. `0.80`) wins.
+  (e.g. `0.80`) wins. Set `compression.small_ctx_floor: false` to disable
+  the floor entirely (see below).
+
+### Small-context threshold floor
+
+Models with context windows below 512K have their effective compression
+threshold **floored at 75%** of the window (raise-only). Rationale: at the
+default 50% trigger a 128K-262K model compacts with only ~64-131K consumed,
+and the incompressible floor (system prompt + tool schemas + protected tail +
+rolling summary) eats most of the reclaimed headroom, so compaction re-fires
+every 1-2 turns and the session spends most of its wall-clock summarizing
+(#60989).
+
+The floor is raise-only — an explicitly higher threshold (user config or
+per-model autoraise) always wins.
+
+**Operator opt-out:** `compression.small_ctx_floor: false` disables the
+floor so a configured sub-75% threshold is honored verbatim on sub-512K
+windows. This matters for local llama.cpp servers whose `n_ctx` is a hard
+wall: at a 75% trigger the *estimated* threshold can already correspond to a
+*real* prompt past the wall (the local chars/4 estimate undercounts dense
+tool output), so compression fires only after the session has grown over the
+limit and can no longer be shrunk back under it. With the floor disabled, a
+calibrated `threshold` (e.g. `0.57` on a 150K window) keeps compaction ahead
+of the wall. The default (`true`) preserves the upstream behavior, so an
+unset key is behavior-neutral.
 
 Plugin context engines can reuse the same resolution logic via
 `from agent.context_compressor import resolve_model_threshold`; engines that

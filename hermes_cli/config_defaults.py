@@ -623,6 +623,14 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "small_ctx_floor": True,      # when True (default), models with context
+                                      # windows below 512K have their compression
+                                      # threshold floored at 0.75 (raise-only) to
+                                      # stop compaction thrash (#60989). Set false
+                                      # to honor a configured sub-0.75 threshold
+                                      # verbatim (e.g. local llama.cpp with a 150K
+                                      # window where a 75% trigger fires only after
+                                      # the prompt has already grown past the limit).
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to

@@ -18,10 +18,11 @@ import agent.context_compressor as cc
 from agent.context_compressor import ContextCompressor
 
 
-def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
+def _make(ctx: int, pct: float = 0.50, small_ctx_floor: bool = True) -> ContextCompressor:
     with patch.object(cc, "get_model_context_length", return_value=ctx):
         comp = ContextCompressor(
             model="test/model", threshold_percent=pct, quiet_mode=True,
+            small_ctx_floor=small_ctx_floor,
         )
         # Resolve while the mock is active — lazy init (#32221) defers the
         # window probe (and the floor application) past __init__.
@@ -50,6 +51,46 @@ class TestSmallContextThresholdFloor:
         comp.update_model("small", 200_000)
         assert comp.threshold_percent == 0.75
         assert comp.threshold_tokens == 150_000
+
+
+class TestSmallContextFloorOptOut:
+    """compression.small_ctx_floor: false must honor a configured sub-75%
+    threshold verbatim on sub-512K windows (operator opt-out, #60989)."""
+
+    def test_disabled_floor_keeps_configured_sub_75_percent(self):
+        for ctx in (128_000, 150_016, 262_144, 511_999):
+            comp = _make(ctx, pct=0.57, small_ctx_floor=False)
+            assert comp.threshold_percent == 0.57, ctx
+            assert comp.threshold_tokens == int(ctx * 0.57), ctx
+
+    def test_disabled_floor_default_is_enabled(self):
+        # Default (param omitted) must preserve the upstream floor so an
+        # unset config key is behavior-neutral.
+        with patch.object(cc, "get_model_context_length", return_value=150_016):
+            comp = ContextCompressor(
+                model="test/model", threshold_percent=0.57, quiet_mode=True,
+            )
+            _ = comp.context_length
+        assert comp.threshold_percent == 0.75
+        assert comp.threshold_tokens == int(150_016 * 0.75)
+
+    def test_disabled_floor_survives_update_model_both_directions(self):
+        comp = _make(150_016, pct=0.57, small_ctx_floor=False)
+        assert comp.threshold_percent == 0.57
+        # small -> large: stays the configured value either way
+        comp.update_model("big", 1_000_000)
+        assert comp.threshold_percent == 0.57
+        # large -> small: floor must NOT re-apply
+        comp.update_model("small", 200_000)
+        assert comp.threshold_percent == 0.57
+        assert comp.threshold_tokens == int(200_000 * 0.57)
+
+    def test_disabled_floor_above_75_percent_unchanged(self):
+        # A configured threshold already above 75% is unaffected by the
+        # opt-out (the floor is raise-only).
+        comp = _make(150_016, pct=0.80, small_ctx_floor=False)
+        assert comp.threshold_percent == 0.80
+        assert comp.threshold_tokens == int(150_016 * 0.80)
 
 
 class TestReasoningExcludedFromSummarizer:

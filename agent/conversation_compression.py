@@ -1759,7 +1759,10 @@ def check_compression_model_feasibility(agent: Any) -> None:
             if main_ctx and isinstance(agent.context_compressor, _CC):
                 recomputed_threshold = _CC._compute_threshold_tokens(
                     main_ctx,
-                    _CC._effective_threshold_percent(main_ctx, safe_pct / 100),
+                    _CC._effective_threshold_percent(
+                        main_ctx, safe_pct / 100,
+                        getattr(agent.context_compressor, "small_ctx_floor", True),
+                    ),
                     getattr(agent.context_compressor, "max_tokens", None),
                 )
             threshold_suggestion_viable = (
