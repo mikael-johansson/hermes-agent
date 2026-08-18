@@ -1636,6 +1636,48 @@ class AIAgent:
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
+    def _effective_max_output_tokens(self) -> Optional[int]:
+        """Resolve the effective output-token cap for the current request.
+
+        Mirrors the transport's max_tokens resolution
+        (``agent/transports/chat_completions.py::_build_kwargs_from_profile``)
+        so callers — chiefly the pre-send fit guard — budget against the SAME
+        cap the provider will actually honour:
+
+          1. the one-shot ``_ephemeral_max_output_tokens`` override (the
+             available-output reducer's whack-a-mole after an output-cap
+             error),
+          2. the user-configured ``max_tokens`` (``model.max_tokens``),
+          3. the provider profile's ``get_max_tokens(model)`` default (the
+             static ``default_max_tokens`` when the user hasn't set one).
+
+        Returns ``None`` only when no cap is resolvable (no user value and
+        neither a provider profile nor a profile default) — callers then fall
+        back to their own minimal-response floor, matching the transport.
+
+        Why this method exists: the fit guard must NOT read ``self.max_tokens``
+        directly. For a custom / vLLM provider with no ``model.max_tokens`` in
+        config that value is ``None`` while the transport still sends the
+        profile default (e.g. 65536). A guard budgeted on ``None`` only sees a
+        512-token floor, never the real 65536, and lets a request sail into the
+        context wall (``input + 65536 > window``) instead of compressing first.
+        """
+        ephemeral = getattr(self, "_ephemeral_max_output_tokens", None)
+        if ephemeral is not None:
+            return int(ephemeral)
+        if self.max_tokens:
+            return int(self.max_tokens)
+        try:
+            from providers import get_provider_profile
+            profile = get_provider_profile(self.provider)
+        except Exception:
+            profile = None
+        if profile is not None:
+            default = profile.get_max_tokens(self.model)
+            if default:
+                return int(default)
+        return None
+
     @staticmethod
     def _requested_output_cap_from_api_kwargs(api_kwargs: Any) -> Optional[int]:
         """Extract the outgoing response token cap from a prepared request."""

@@ -2277,7 +2277,12 @@ def run_conversation(
             _pre_send_wall = not prompt_fits_window(
                 request_pressure_tokens,
                 _known_window,
-                max_output_tokens=getattr(agent, "max_tokens", None),
+                # Resolve the effective output cap the SAME way the transport
+                # does (ephemeral > user max_tokens > profile default). Reading
+                # only agent.max_tokens made the guard blind to the profile's
+                # default_max_tokens, so a None user cap fell to the 512 floor
+                # and the guard never fired against the real (profile) cap.
+                max_output_tokens=agent._effective_max_output_tokens(),
             )[0]
         if (
             agent.compression_enabled

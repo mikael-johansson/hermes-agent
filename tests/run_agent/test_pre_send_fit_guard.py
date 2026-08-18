@@ -399,3 +399,57 @@ class TestCalibratedRoughNote:
         assert any(v == 100_000 for v in noted), (
             f"expected a calibrated 100,000 rough note, got {noted}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Effective output-cap resolution (fit guard must see the profile default)
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveMaxOutputTokens:
+    """The fit guard resolves the output cap the SAME way the transport does:
+    ``ephemeral > user max_tokens > profile default``. Before this fix the
+    guard read only ``agent.max_tokens`` (None when the config omits it) and
+    ``prompt_fits_window`` fell to the 512 floor — blind to the profile's
+    ``default_max_tokens`` (e.g. 65,536) that the transport actually sends.
+
+    A session whose calibrated request + profile cap exceeded the window but
+    whose request + 512 did not sailed past the guard and died at the wall
+    (``de48184dd5c0``). These tests pin the resolution so the guard and the
+    transport can never disagree on the cap again.
+    """
+
+    def test_none_user_cap_resolves_profile_default(self, agent):
+        """No user ``max_tokens``: the profile's ``default_max_tokens`` wins —
+        this is the bug. (Fails before the fix: the method did not exist, and
+        the guard's old ``getattr(agent, "max_tokens", None)`` gave 512.)"""
+        agent.provider = "custom"
+        profile = SimpleNamespace(get_max_tokens=lambda _m: 65_536)
+        with patch("providers.get_provider_profile", return_value=profile):
+            assert agent._effective_max_output_tokens() == 65_536
+
+    def test_user_cap_wins_over_profile_default(self, agent):
+        """An explicit user ``max_tokens`` takes priority over the profile
+        default (matches the transport's ``_user_max > _profile_max`` order)."""
+        agent.provider = "custom"
+        agent.max_tokens = 32_768
+        profile = SimpleNamespace(get_max_tokens=lambda _m: 65_536)
+        with patch("providers.get_provider_profile", return_value=profile):
+            assert agent._effective_max_output_tokens() == 32_768
+
+    def test_ephemeral_cap_wins_over_all(self, agent):
+        """A set ``_ephemeral_max_output_tokens`` (compression-driven trim)
+        overrides both the user cap and the profile default."""
+        agent.provider = "custom"
+        agent.max_tokens = 32_768
+        agent._ephemeral_max_output_tokens = 1_234
+        profile = SimpleNamespace(get_max_tokens=lambda _m: 65_536)
+        with patch("providers.get_provider_profile", return_value=profile):
+            assert agent._effective_max_output_tokens() == 1_234
+
+    def test_no_profile_no_user_falls_back(self, agent):
+        """Unknown provider and no user cap: no synthetic default is invented
+        — ``None`` lets ``prompt_fits_window`` use its floor (fail-open)."""
+        agent.provider = "custom"
+        with patch("providers.get_provider_profile", return_value=None):
+            assert agent._effective_max_output_tokens() is None
