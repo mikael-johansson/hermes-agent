@@ -5,6 +5,7 @@ and run_agent.py for pre-flight context checks.
 """
 
 import base64
+import math
 import hashlib
 import ipaddress
 import json
@@ -3031,6 +3032,136 @@ _CJK_DENSE_RE = re.compile(
 )
 
 
+def apply_token_estimate_scale(tokens: int, scale: float) -> int:
+    """Apply a per-model token-estimate calibration multiplier.
+
+    The base estimator assumes ~4 chars/token (English-centric). Dense
+    workloads — JSON dumps, Python tracebacks, markdown tables — tokenize
+    far denser (measured ~2.5 chars/token on a Qwen BPE), so the estimate
+    undercounts the real prompt by ~1.5-2.5x. That is the *dangerous*
+    direction for a provider with a hard context wall: the pre-flight
+    trigger and the pre-send fit guard both run on the estimate, so an
+    undercount makes compaction fire only after the real prompt has already
+    grown past the limit.
+
+    ``scale`` multiplies the base estimate so it tracks the real tokenizer.
+    ``1.0`` (the default) preserves the historical behavior exactly — no
+    scaling — so callers that do not calibrate are byte-identical. The
+    multiplier is applied at the *aggregate* level (the caller's total),
+    never inside the per-message memo, so the memo key/value stays valid
+    regardless of the scale in force.
+    """
+    if not tokens:
+        return 0
+    if scale is None or scale == 1.0:
+        return tokens
+    try:
+        f = float(scale)
+    except (TypeError, ValueError):
+        return tokens
+    if f <= 0:
+        return tokens
+    # Ceiling, matching estimate_tokens_rough's short-text convention: a
+    # calibration must never floor the scaled value (math.ceil handles the
+    # float edges where x % 1 is 0.0 on a non-integer x, e.g. 3 * 1.5).
+    return math.ceil(tokens * f)
+
+
+def resolve_token_estimate_scale(model, scale_cfg) -> float:
+    """Resolve the effective token-estimate calibration multiplier for ``model``.
+
+    ``scale_cfg`` is the ``compression.token_estimate_scale`` /
+    ``compression.token_estimate_scales`` config (or ``None``). Per-model
+    overrides win; otherwise the global scale applies; default 1.0 (no
+    scaling, historical behavior). Reading the *current* model at call time
+    (rather than caching at init) keeps the number correct across failover.
+    Returns a positive float; invalid input degrades to 1.0.
+    """
+    def _as_positive_float(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 1.0
+        return f if f > 0 else 1.0
+
+    if isinstance(scale_cfg, dict):
+        per_model = scale_cfg.get("scales")
+        if isinstance(per_model, dict) and model is not None:
+            hit = per_model.get(str(model))
+            if hit is None:
+                # Case-insensitive / suffix match so "Qwen3.8-27B" matches a
+                # "qwen3.8-27b" key the user wrote by hand.
+                _m = str(model).lower()
+                for k, v in per_model.items():
+                    if str(k).lower() == _m:
+                        hit = v
+                        break
+            if hit is not None:
+                return _as_positive_float(hit)
+        return _as_positive_float(scale_cfg.get("scale", 1.0))
+    if isinstance(scale_cfg, (int, float)) and not isinstance(
+        scale_cfg, bool
+    ):
+        # Raw scalar config (the documented user-facing form,
+        # ``token_estimate_scale: 1.6``): a single global scale with no
+        # per-model overrides. Accept it directly so the function handles the
+        # full config shape, not just the post-normalization dict that
+        # agent_init stores.
+        return _as_positive_float(scale_cfg)
+    return 1.0
+
+
+def prompt_fits_window(
+    prompt_tokens: int,
+    context_length: int,
+    *,
+    max_output_tokens: int | None = None,
+    min_response_tokens: int = 512,
+    safety_margin: int = 0,
+) -> tuple:
+    """Pre-send fit check for providers with a hard context wall.
+
+    Returns ``(fits, usable_input_budget)``.
+
+    A provider whose ``n_ctx`` is a hard wall (llama.cpp) rejects or
+    *truncates* any request whose prompt leaves no room for output. Unlike
+    a hosted API that returns a clean context-overflow error, it emits a
+    truncated stream and the client re-sends the same oversized prompt — a
+    retry loop with no recoverable signal. The only safe response is to
+    never *send* a prompt that cannot fit.
+
+    This is independent of the compression *threshold* (a soft "compact for
+    health" trigger). The threshold may sit at e.g. 57% of the window while
+    the wall is at 100%; the fit guard catches the gap between them and
+    refuses to send a request that would overflow the wall even for a
+    minimal response.
+
+    Args:
+        prompt_tokens: rough (calibrated) estimate of the prompt's tokens.
+        context_length: the model's total window (``n_ctx``). ``0``/unknown
+            means "cannot judge" -> ``(True, 0)`` so the caller never blocks
+            on an unknown window (fail-open for the *unknown* case only).
+        max_output_tokens: reserved output cap, if set. When present the
+            provider already reserves it from the window, so the prompt must
+            fit in ``context_length - max_output_tokens``.
+        min_response_tokens: floor of output room to reserve when no cap is
+            set, so a response can still form (default 512).
+        safety_margin: extra tokens kept free (default 0).
+
+    Fail-closed on *known* overflow: when the window is known and the prompt
+    cannot fit, ``fits`` is False and the caller must compress before sending.
+    """
+    if not context_length or context_length <= 0:
+        # Unknown window: we cannot prove overflow, so don't block.
+        return True, 0
+    margin = max(0, int(safety_margin or 0))
+    if max_output_tokens and max_output_tokens > 0:
+        usable_input = context_length - max_output_tokens - margin
+        return prompt_tokens <= usable_input, max(0, usable_input)
+    usable_input = context_length - max(1, int(min_response_tokens or 1)) - margin
+    return prompt_tokens <= usable_input, max(0, usable_input)
+
+
 def estimate_tokens_rough(text: str) -> int:
     """Rough token estimate for pre-flight checks.
 
@@ -3062,7 +3193,7 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], scale: float = 1.0) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
@@ -3075,12 +3206,16 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     long history every iteration only pays for messages whose object graph
     actually changed. The memo is exact: equal fingerprints imply identical
     leaf objects and structure, hence an identical estimate.
+
+    ``scale`` (default 1.0 = historical behavior) is a per-model calibration
+    multiplier applied to the AGGREGATE total (never per-message, so the
+    memo stays valid). See :func:`apply_token_estimate_scale`.
     """
     _IMAGE_TOKEN_COST = 1500
     total = 0
     for msg in messages:
         total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST)
-    return total
+    return apply_token_estimate_scale(total, scale)
 
 
 # --- Per-message token-estimate memo -------------------------------------
@@ -3268,6 +3403,7 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    scale: float = 1.0,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3276,14 +3412,20 @@ def estimate_request_tokens_rough(
     tools enabled, schemas alone can add 20-30K tokens — a significant
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
+
+    ``scale`` (default 1.0 = historical behavior) is a per-model
+    calibration multiplier applied to the AGGREGATE total (never
+    per-message, so the message memo stays valid). See
+    :func:`apply_token_estimate_scale`. Callers that do not calibrate
+    pass nothing and are byte-identical to the historical behavior.
     """
     total = 0
     if system_prompt:
-        total += estimate_tokens_rough(system_prompt)
+        total += apply_token_estimate_scale(estimate_tokens_rough(system_prompt), scale)
     if messages:
-        total += estimate_messages_tokens_rough(messages)
+        total += estimate_messages_tokens_rough(messages, scale=scale)
     if tools:
-        total += _estimate_tools_tokens_rough(tools)
+        total += apply_token_estimate_scale(_estimate_tools_tokens_rough(tools), scale)
     return total
 
 

@@ -45,6 +45,7 @@ from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    resolve_token_estimate_scale,
 )
 
 logger = logging.getLogger(__name__)
@@ -336,11 +337,26 @@ def _compression_warrants_another_preflight_pass(
     )
 
 
+def _agent_estimate_scale(agent) -> float:
+    """Resolve the current agent's token-estimate calibration multiplier.
+
+    Reads the raw config off the agent and resolves it against the CURRENT
+    ``agent.model`` (failover-safe). Default 1.0 = historical behavior. A
+    missing/invalid config degrades to 1.0, never an error.
+    """
+    try:
+        cfg = getattr(agent, "compression_token_estimate_scale", None)
+        return resolve_token_estimate_scale(getattr(agent, "model", None), cfg)
+    except Exception:
+        return 1.0
+
+
 def _should_run_preflight_estimate(
     messages: List[Dict[str, Any]],
     protect_first_n: int,
     protect_last_n: int,
     threshold_tokens: int,
+    scale: float = 1.0,
 ) -> bool:
     """Cheap gate for the (expensive) full preflight token estimate.
 
@@ -358,10 +374,15 @@ def _should_run_preflight_estimate(
     system prompt and tool schemas — because it is only a *hint* deciding
     whether to pay for the authoritative ``estimate_request_tokens_rough``,
     which (together with ``should_compress``) makes the real decision.
+
+    ``scale`` is the per-model token-estimate calibration multiplier; the
+    cheap gate and the authoritative estimate it gates must stay on the SAME
+    calibrated basis (else a calibrated full-estimate could undercount
+    relative to an unscaled gate and skip a needed estimate). Default 1.0.
     """
     if len(messages) > protect_first_n + protect_last_n + 1:
         return True
-    return estimate_messages_tokens_rough(messages) >= threshold_tokens
+    return estimate_messages_tokens_rough(messages, scale=scale) >= threshold_tokens
 
 
 def _should_idle_compact(
@@ -838,16 +859,22 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    # Calibrated token-estimate scale for this agent's current model
+    # (failover-safe, default 1.0). The gate and the authoritative estimate
+    # below must share the SAME calibrated basis.
+    _est_scale = _agent_estimate_scale(agent)
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
+        scale=_est_scale,
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
+            scale=_est_scale,
         )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
@@ -1012,6 +1039,7 @@ def build_turn_context(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
+                    scale=_est_scale,
                 )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens

@@ -43,6 +43,7 @@ from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
+    _agent_estimate_scale,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
@@ -66,11 +67,13 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
+    apply_token_estimate_scale,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    prompt_fits_window,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -2153,9 +2156,22 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        # Calibrated (per-model) scale so this basis matches the turn
+        # prologue's preflight and the (rough, real) defer baseline:
+        # dense workloads tokenize far denser than the 4 chars/token base
+        # estimator, and an undercount here is exactly what let a session
+        # reach the provider wall before compression fired (112,512 est ≈
+        # 170K real vs a 150,016 wall). Default 1.0 = historical behavior.
+        _est_scale = _agent_estimate_scale(agent)
+        approx_tokens = estimate_messages_tokens_rough(
+            api_messages, scale=_est_scale
+        )
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            apply_token_estimate_scale(
+                _estimate_tools_tokens_rough(agent.tools), _est_scale
+            )
+            if agent.tools
+            else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2240,6 +2256,29 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _over_threshold = _compressor.should_compress(request_pressure_tokens)
+        # Pre-send fit guard for providers with a hard context wall
+        # (llama.cpp): the compression threshold is a soft "compact for
+        # health" trigger that may sit well below the window (e.g. 57%),
+        # and a rough estimate can still undercount a dense payload. The
+        # gap between threshold and wall is the zone where a session sends
+        # into the wall with no pre-send signal — a truncated stream with
+        # no recoverable error, not a clean context-overflow 400. When the
+        # calibrated estimate leaves no room for a minimal response inside
+        # the known window, treat it as a second trigger for the SAME
+        # pre-API compression pass below (one mechanism, no parallel block):
+        # compress now instead of sending into the wall. Unknown window
+        # (context_length 0) => fits (fail-open for the unknown case only),
+        # and the defer/cooldown/blocked predicates below stand down the
+        # guard exactly as they do for the threshold trigger.
+        _known_window = int(getattr(_compressor, "context_length", 0) or 0)
+        _pre_send_wall = _known_window > 0
+        if _pre_send_wall:
+            _pre_send_wall = not prompt_fits_window(
+                request_pressure_tokens,
+                _known_window,
+                max_output_tokens=getattr(agent, "max_tokens", None),
+            )[0]
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -2247,8 +2286,15 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and (_over_threshold or _pre_send_wall)
         ):
+            _trigger = (
+                f"pre-send fit: ~{request_pressure_tokens:,} > "
+                f"{_known_window:,} window (calibrated)"
+                if _pre_send_wall and not _over_threshold
+                else f"threshold ~{request_pressure_tokens:,} >= "
+                f"{_preflight_threshold:,}"
+            )
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -2262,10 +2308,8 @@ def run_conversation(
             if callable(_clear_warn):
                 _clear_warn()
             logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/%s)",
-                f"{request_pressure_tokens:,}",
-                f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                "Pre-API compression: %s (context=%s, attempt=%s/%s)",
+                _trigger,
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,

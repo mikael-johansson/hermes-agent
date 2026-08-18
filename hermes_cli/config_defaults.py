@@ -623,6 +623,26 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "token_estimate_scale": 1.0,  # per-model multiplier applied to the rough
+                                      # (chars/4) token estimate so it tracks the
+                                      # REAL tokenizer. The base heuristic is
+                                      # English-centric and undercounts dense
+                                      # JSON/traceback/table content (measured
+                                      # ~1.5-2.5x on Qwen BPE), which is the
+                                      # DANGEROUS direction for a provider with a
+                                      # hard context wall: the pre-flight trigger
+                                      # and the pre-send fit guard both run on the
+                                      # estimate, so an undercount makes compaction
+                                      # fire only after the prompt has already
+                                      # grown past the limit. Set to the measured
+                                      # real/estimate ratio (e.g. 1.6) to keep the
+                                      # estimate honest. 1.0 (default) = no
+                                      # scaling (historical behavior). A per-model
+                                      # map may be given instead as
+                                      # {scale: <float>, scales: {<model>: <float>}}
+                                      # — a matching model key wins, else scale.
+                                      # See agent.model_metadata
+                                      # .resolve_token_estimate_scale.
         "small_ctx_floor": True,      # when True (default), models with context
                                       # windows below 512K have their compression
                                       # threshold floored at 0.75 (raise-only) to

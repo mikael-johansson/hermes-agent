@@ -2050,6 +2050,25 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Per-model token-estimate calibration. The base chars/4 heuristic is
+    # English-centric and undercounts dense tool output (JSON/tracebacks/
+    # tables) by ~1.5-2.5x on Qwen-family BPE — the dangerous direction for a
+    # hard context wall. Store the RAW config here (not a pre-resolved float)
+    # so it resolves against the CURRENT model at each call site: failover
+    # swaps agent.model mid-turn, and a cached value would go stale. See
+    # agent.model_metadata.resolve_token_estimate_scale. Default 1.0 (no
+    # scaling) keeps unconfigured deployments byte-identical.
+    _raw_token_estimate_scale = _compression_cfg.get(
+        "token_estimate_scale", 1.0
+    )
+    if isinstance(_raw_token_estimate_scale, (int, float)) and not isinstance(
+        _raw_token_estimate_scale, bool
+    ):
+        compression_token_estimate_scale_cfg = {"scale": _raw_token_estimate_scale}
+    elif isinstance(_raw_token_estimate_scale, dict):
+        compression_token_estimate_scale_cfg = _raw_token_estimate_scale
+    else:
+        compression_token_estimate_scale_cfg = None
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2578,6 +2597,12 @@ def init_agent(
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
+    # Raw token-estimate calibration config (see parse above). Stored on the
+    # agent — NOT resolved to a float here — so the call sites can resolve it
+    # against the CURRENT model at each use. Failover swaps agent.model
+    # mid-turn; a value frozen at init would go stale for the new model.
+    # resolve_token_estimate_scale(model, cfg) is cheap and reads no globals.
+    agent.compression_token_estimate_scale = compression_token_estimate_scale_cfg
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
