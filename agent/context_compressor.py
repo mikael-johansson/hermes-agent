@@ -38,6 +38,8 @@ from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
+    apply_token_estimate_scale,
+    resolve_token_estimate_scale,
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
@@ -511,6 +513,84 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # call (see the no-wire-cap contract test in
 # test_compression_small_ctx_threshold_floor.py).
 _SUMMARY_INPUT_MAX_CHARS = 160_000
+
+# Finding 05 (investigations/context-compression): _SUMMARY_INPUT_MAX_CHARS is
+# a LATENCY bound (slow aux backends time out on huge single prompts), not a
+# WINDOW bound. The summarizer call shares the main model's context window when
+# no separate aux model is configured, and the provider carves the output
+# reservation (max_tokens) out of that window. So the ASSEMBLED summarizer
+# prompt (previous summary + new turns + template) must additionally be
+# budgeted in TOKENS against window - output_reservation - margin, shrinking
+# the per-block char caps until it fits. A 148k window with a 16,384
+# reservation and two 160k-char blocks produced a 131,617-token prompt
+# (131,617 + 16,384 = 148,001 > 148,000) → HTTP 400, three times, session dead.
+# This margin covers template overhead, tokenizer drift, and provider
+# bookkeeping on top of the hard window - reservation boundary.
+_SUMMARY_PROMPT_MARGIN_TOKENS = 2048
+# Smallest per-block char cap the window-budget tightening loop may reach.
+# Below this the summary has less material than a meaningful checkpoint; a
+# window that small for the summarizer is unworkable anyway, and the loop logs
+# a loud warning instead of thrashing.
+_SUMMARY_INPUT_MIN_BLOCK_CHARS = 8_000
+
+# Marker used by _bound_summary_content when the char cap that trimmed the
+# block was the *latency* cap (the historical _SUMMARY_INPUT_MAX_CHARS). Kept
+# byte-identical to the pre-finding-05 string so existing handoff-classifier
+# tests (test_marker_does_not_collide_with_summary_classifier) keep matching.
+_SUMMARY_BOUND_MARKER_TEMPLATE = (
+    "\n\n...[summary input truncated: omitted "
+    "{omitted:,} chars from the middle to keep compression prompt bounded]...\n\n"
+)
+# Distinct marker for the window-budget tightening pass (finding 05). It must
+# NOT contain the "summary input truncated" substring so callers/tests can tell
+# the two bounding regimes apart, and it must not resemble a compaction
+# handoff prefix (SUMMARY_PREFIX / "[CONTEXT SUMMARY]:").
+_SUMMARY_WINDOW_BOUND_MARKER_TEMPLATE = (
+    "\n\n...[summary input window-truncated: omitted "
+    "{omitted:,} chars to keep the summarizer prompt inside the model's "
+    "context window]...\n\n"
+)
+
+
+def _bound_summary_content(content: str, max_chars: int, window_limited: bool = False) -> str:
+    """Cap a single summarizer input block to ``max_chars`` chars, preserving head + tail.
+
+    Per-message truncation alone is not enough for very long sessions: a
+    compression window with hundreds of messages can still produce a huge
+    single prompt. Both edges are kept because the beginning often has task
+    setup and the tail has the most recent state; the omitted middle is
+    explicitly marked so the summarizer knows context was intentionally
+    compressed before it saw the prompt.
+
+    ``window_limited`` selects the marker text: ``False`` is the historical
+    latency-cap marker, ``True`` is the window-budget marker (finding 05)
+    used when the per-block cap was tightened below the latency cap to fit
+    the model's context window. The marker-only difference lets callers
+    distinguish the two regimes (see the window-truncated assertions in
+    TestSummaryPromptWindowBudget).
+    """
+    if len(content) <= max_chars:
+        return content
+    template = (
+        _SUMMARY_WINDOW_BOUND_MARKER_TEMPLATE
+        if window_limited
+        else _SUMMARY_BOUND_MARKER_TEMPLATE
+    )
+    # Estimate once, then rebuild with the exact omitted span after the
+    # head/tail split is known. The second marker can differ by a few chars
+    # if the comma-formatted number changes width, so recompute once.
+    marker = template.format(omitted=len(content))
+    remaining = max(max_chars - len(marker), 0)
+    head_chars = int(remaining * 0.45)
+    tail_chars = remaining - head_chars
+    omitted = max(len(content) - head_chars - tail_chars, 0)
+    marker = template.format(omitted=omitted)
+    remaining = max(max_chars - len(marker), 0)
+    head_chars = int(remaining * 0.45)
+    tail_chars = remaining - head_chars
+    tail = content[-tail_chars:].lstrip() if tail_chars else ""
+    return content[:head_chars].rstrip() + marker + tail
+
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -2544,6 +2624,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         small_ctx_floor: bool = True,
+        token_estimate_scale_cfg: Any = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -2621,6 +2702,15 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Per-model token-estimate calibration (finding 05,
+        # investigations/context-compression): ``compression.token_estimate_scale``
+        # as resolved by agent_init — either None, {"scale": float}, or a
+        # per-model override mapping. Multiplies the chars/4 rough estimator so
+        # the window-budget fit check (_estimate_summary_input_tokens) tracks
+        # the real tokenizer for dense workloads. Read via getattr() so tests
+        # that construct the compressor directly can set the attribute without
+        # passing the kwarg.
+        self.token_estimate_scale_cfg = token_estimate_scale_cfg
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -3545,6 +3635,11 @@ class ContextCompressor(ContextEngine):
     # per-message limits above. Alias of the module-level constant (which
     # carries the full rationale) so subclasses/tests can override per-class.
     _SUMMARY_INPUT_MAX_CHARS = _SUMMARY_INPUT_MAX_CHARS
+    # Finding 05: token-margin subtracted from (window - output reservation)
+    # to size the summarizer-prompt budget. Class attribute (alias of the
+    # module-level constant) so subclasses/tests can override per-class,
+    # matching _SUMMARY_INPUT_MAX_CHARS above.
+    _SUMMARY_PROMPT_MARGIN_TOKENS = _SUMMARY_PROMPT_MARGIN_TOKENS
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
@@ -3837,37 +3932,28 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return summary
 
     @classmethod
-    def _bound_summary_input(cls, content: str) -> str:
-        """Cap total summarizer input while preserving beginning and recent tail.
+    def _bound_summary_input(
+        cls,
+        content: str,
+        char_cap: int | None = None,
+        window_limited: bool = False,
+    ) -> str:
+        """Cap a summarizer input block while preserving beginning and recent tail.
 
-        Per-message truncation alone is not enough for very long sessions: a
-        compression window with hundreds of messages can still produce a huge
-        single prompt that slow auxiliary backends time out on. Keep both edges
-        because the beginning often has task setup and the tail has the most
-        recent state; explicitly mark the omitted middle so the summarizer knows
-        context was intentionally compressed before it saw the prompt.
+        Thin wrapper over :func:`_bound_summary_content` so the per-block char
+        cap and marker regime are configurable. ``char_cap`` defaults to the
+        class ``_SUMMARY_INPUT_MAX_CHARS`` (the latency cap); the window-budget
+        tightening pass (finding 05) passes a smaller cap plus
+        ``window_limited=True`` to get the window-truncated marker. Keeping the
+        classmethod (not only the module helper) preserves the historical
+        ``ContextCompressor._bound_summary_input(str)`` contract used by
+        existing tests.
         """
-        if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
-            return content
-
-        marker_template = (
-            "\n\n...[summary input truncated: omitted "
-            "{omitted:,} chars from the middle to keep compression prompt bounded]...\n\n"
+        return _bound_summary_content(
+            content,
+            cls._SUMMARY_INPUT_MAX_CHARS if char_cap is None else char_cap,
+            window_limited,
         )
-        # Estimate once, then rebuild with the exact omitted span after the
-        # head/tail split is known. The second marker can differ by a few chars
-        # if the comma-formatted number changes width, so recompute once.
-        marker = marker_template.format(omitted=len(content))
-        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
-        head_chars = int(remaining * 0.45)
-        tail_chars = remaining - head_chars
-        omitted = max(len(content) - head_chars - tail_chars, 0)
-        marker = marker_template.format(omitted=omitted)
-        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
-        head_chars = int(remaining * 0.45)
-        tail_chars = remaining - head_chars
-        tail = content[-tail_chars:].lstrip() if tail_chars else ""
-        return content[:head_chars].rstrip() + marker + tail
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -3899,6 +3985,199 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
+
+    def _summary_input_token_budget(self) -> int:
+        """Usable TOKEN budget for the assembled summarizer prompt.
+
+        Finding 05 (investigations/context-compression, 2026-08-20): the 160k
+        char cap on each input block is a LATENCY bound, not a window bound.
+        When the summarizer shares the main model's context window (no separate
+        aux model) and the provider carves the output reservation
+        (``self.max_tokens``) out of that window, two char-capped blocks can
+        still overflow the window: a 148,000-token window with a 16,384 output
+        reservation held 131,617 prompt tokens (131,617 + 16,384 = 148,001 >
+        148,000) → HTTP 400, session dead. This method returns the token
+        ceiling the assembled prompt (blocks + template + memory + focus) must
+        stay under: ``window - output_reservation - margin``.
+
+        Returns ``0`` when no window is known (``context_length`` 0) — an
+        unworkable budget that forces the caller to skip the summarizer rather
+        than send an unbounded prompt. ``max_tokens`` is the provider-carved
+        output reservation (``None``/0 when the provider uses its own default
+        ⇒ no reservation); the 2048-token margin absorbs the rough-estimate
+        error so a calibrated dense prompt is never one token over.
+        """
+        try:
+            window = int(self.context_length or 0)
+        except Exception:
+            return 0
+        if window <= 0:
+            return 0
+        reservation = getattr(self, "max_tokens", None)
+        reservation = reservation if isinstance(reservation, int) else 0
+        return max(window - reservation - self._SUMMARY_PROMPT_MARGIN_TOKENS, 0)
+
+    def _estimate_summary_input_tokens(self, text: str) -> int:
+        """Rough token estimate of a summarizer prompt, calibrated.
+
+        ``estimate_tokens_rough`` assumes ~4 chars/token (English-centric) and
+        undercounts dense workloads (JSON, tracebacks, tables measure ~2.5
+        chars/token on a Qwen BPE). The per-model ``token_estimate_scale_cfg``
+        calibration (``compression.token_estimate_scale``) multiplies the
+        estimate so the window-fit check tracks the real tokenizer. Scale
+        1.0 (default) is byte-identical to the raw rough estimate.
+        """
+        if not text:
+            return 0
+        scale = resolve_token_estimate_scale(
+            self.model, getattr(self, "token_estimate_scale_cfg", None)
+        )
+        return apply_token_estimate_scale(estimate_tokens_rough(text), scale)
+
+    def _summarizer_shares_main_window(self) -> bool:
+        """True when the summarizer call uses the main model's context window.
+
+        The window-budget tightening pass (finding 05) only applies when the
+        summary call shares the main model's window — i.e. there is no
+        separate ``summary_model`` override (or it resolves to the main model).
+        A distinct aux model has its own window and its own reservation, so the
+        main window's output reservation is not carved from it and the
+        char-cap latency bound is sufficient.
+        """
+        if not self.summary_model:
+            return True
+        # A summary_model that equals the main model is the same window.
+        return str(self.summary_model) == str(self.model)
+
+    def _assemble_summarizer_prompt(
+        self,
+        previous_summary: Optional[str],
+        new_turns: str,
+        memory_section: str,
+        template_sections: str,
+        preamble: str,
+        focus_topic: Optional[str] = None,
+    ) -> str:
+        """Assemble the full summarizer prompt string.
+
+        Extracted from :meth:`_generate_summary` so the window-budget
+        tightening pass can rebuild the prompt at a smaller block cap without
+        re-deriving the preamble / template / memory section. The exact
+        template markers (``PREVIOUS SUMMARY`` / ``NEW TURNS TO INCORPORATE`` /
+        ``TURNS TO SUMMARIZE``) and ``SUMMARY_PREFIX``-free preamble are
+        preserved verbatim so existing classifier + handoff tests keep
+        matching. ``previous_summary`` is the ALREADY-bounded previous-summary
+        block (the caller applies ``_bound_summary_input`` with the chosen
+        char cap + window-limited flag before passing it in).
+        """
+        if previous_summary:
+            prompt = f"""{preamble}
+
+You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+
+PREVIOUS SUMMARY:
+{previous_summary}
+
+NEW TURNS TO INCORPORATE:
+{new_turns}{memory_section}
+
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+
+{template_sections}"""
+        else:
+            prompt = f"""{preamble}
+
+Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+TURNS TO SUMMARIZE:
+{new_turns}{memory_section}
+
+Use this exact structure:
+
+{template_sections}"""
+        if focus_topic:
+            prompt += f"""
+
+FOCUS TOPIC: "{focus_topic}"
+This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to "{focus_topic}", summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+        return prompt
+
+    def _summary_prompt_fits_window(
+        self,
+        raw_previous: Optional[str],
+        raw_turns: str,
+        memory_section: str,
+        template_sections: str,
+        preamble: str,
+        focus_topic: Optional[str] = None,
+    ) -> tuple[str, Optional[str]]:
+        """Window-budget tightening pass (finding 05).
+
+        Assembles the summarizer prompt and, if its calibrated token estimate
+        exceeds :meth:`_summary_input_token_budget`, repeatedly shrinks the
+        per-block char cap (both the previous-summary block and the serialized
+        new-turns block) — preserving each block's head + tail and its marker —
+        until the whole prompt fits. When the char cap already keeps the prompt
+        in budget (large window / low-density content) this returns immediately
+        with the char-capped blocks and the historical latency marker, so no
+        unnecessary tightening occurs (test_char_cap_still_binds_when_window_is_large).
+
+        Returns ``(prompt, window_tightened)`` where ``window_tightened`` is the
+        window-truncated marker string if a tightening pass ran (for callers
+        that want to log it) else ``None``.
+        """
+        budget = self._summary_input_token_budget()
+        cap = self._SUMMARY_INPUT_MAX_CHARS
+        # The window pass only binds when the summarizer shares the main window
+        # AND the budget is a positive, usable number. With no known window the
+        # budget is 0 and the caller is expected to have already skipped the
+        # summarizer (no window ⇒ no summary), so we never tighten here.
+        if (
+            not self._summarizer_shares_main_window()
+            or budget <= 0
+        ):
+            prev = (
+                self._bound_summary_input(raw_previous)
+                if raw_previous
+                else ""
+            )
+            turns = self._bound_summary_input(raw_turns)
+            return (
+                self._assemble_summarizer_prompt(
+                    prev, turns, memory_section, template_sections, preamble,
+                    focus_topic,
+                ),
+                None,
+            )
+
+        min_cap = _SUMMARY_INPUT_MIN_BLOCK_CHARS
+        window_limited = False
+        while True:
+            prev = (
+                self._bound_summary_input(
+                    raw_previous, char_cap=cap, window_limited=window_limited
+                )
+                if raw_previous
+                else ""
+            )
+            turns = self._bound_summary_input(
+                raw_turns, char_cap=cap, window_limited=window_limited
+            )
+            prompt = self._assemble_summarizer_prompt(
+                prev, turns, memory_section, template_sections, preamble,
+                focus_topic,
+            )
+            est = self._estimate_summary_input_tokens(prompt)
+            if est <= budget or cap <= min_cap:
+                return prompt, (
+                    _SUMMARY_WINDOW_BOUND_MARKER_TEMPLATE
+                    if window_limited
+                    else None
+                )
+            # Tighten: shrink both blocks. The window marker is only emitted
+            # once a shrink actually happens (first tightening iteration).
+            cap = max(int(cap * 0.75), min_cap)
+            window_limited = True
 
     def _generate_summary(
         self,
@@ -3958,7 +4237,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _name not in _pruned_skill_names:
                 _pruned_skill_names.append(_name)
         del _pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
-        content_to_summarize = self._bound_summary_input(content_to_summarize)
+        # ``content_to_summarize`` is the RAW serialized block. It is NOT
+        # bound here: the window-budget tightening pass (finding 05, see
+        # ``_summary_prompt_fits_window``) re-bounds it with the chosen
+        # per-block char cap (char latency cap by default, or a smaller
+        # window-tightened cap) so it is bounded exactly once.
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
             _sanitized_memory_context,
@@ -4151,50 +4434,26 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
-        if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress.
-            # Bound the previous-summary block with the same aggregate cap as
-            # the serialized new turns: a normal summary is far below the cap
-            # (the output side is held to a ~10K-token ceiling), but a
-            # pathological handoff rehydrated from a persisted session can be
-            # arbitrarily large — the iterative prompt (previous summary +
-            # new turns) must stay bounded too.
-            _bounded_previous_summary = self._bound_summary_input(
-                self._previous_summary
+        # Window-budget tightening pass (finding 05): assemble the summarizer
+        # prompt and, if its calibrated token estimate overflows the main
+        # window minus the output reservation, shrink the per-block char caps
+        # (preserving each block's head + tail and its marker) until the whole
+        # prompt fits. When the char cap already keeps the prompt in budget
+        # (large window / low-density content) this returns the char-capped
+        # blocks untouched — no unnecessary tightening (finding 05 test 4).
+        prompt, _window_tightened = self._summary_prompt_fits_window(
+            self._previous_summary,
+            content_to_summarize,
+            _memory_section,
+            _template_sections,
+            _summarizer_preamble,
+            focus_topic,
+        )
+        if _window_tightened:
+            logger.info(
+                "Summarizer prompt window-tightened to fit the model's context "
+                "window (finding 05)."
             )
-            prompt = f"""{_summarizer_preamble}
-
-You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
-
-PREVIOUS SUMMARY:
-{_bounded_previous_summary}
-
-NEW TURNS TO INCORPORATE:
-{content_to_summarize}{_memory_section}
-
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
-
-{_template_sections}"""
-        else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
-
-Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
-
-TURNS TO SUMMARIZE:
-{content_to_summarize}{_memory_section}
-
-Use this exact structure:
-
-{_template_sections}"""
-
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
-        if focus_topic:
-            prompt += f"""
-
-FOCUS TOPIC: "{focus_topic}"
-This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
             call_kwargs = {

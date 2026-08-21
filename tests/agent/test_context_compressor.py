@@ -3352,3 +3352,117 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestSummaryPromptWindowBudget:
+    """Finding 05 (investigations/context-compression, 2026-08-20).
+
+    The summarizer call shares the main model's context window when no
+    separate aux model is configured, and the provider carves the output
+    reservation out of that window. The 160k-char block cap is a LATENCY
+    bound, not a window bound: two 160k-char blocks on a 148k window with a
+    16,384 output reservation produced a 131,617-token summarizer prompt
+    (131,617 + 16,384 = 148,001 > 148,000) — HTTP 400, three times, session
+    dead. The assembled prompt must additionally be budgeted in TOKENS
+    against window - output_reservation - margin, shrinking the block caps
+    (preserving each block's head + tail and its marker) until it fits.
+    """
+
+    _CTX = 148_000
+    _MAX = 16_384
+
+    @staticmethod
+    def _make_compressor():
+        import agent.context_compressor as cc
+        with patch.object(cc, "get_model_context_length", return_value=TestSummaryPromptWindowBudget._CTX):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                config_context_length=TestSummaryPromptWindowBudget._CTX,
+                max_tokens=TestSummaryPromptWindowBudget._MAX,
+            )
+        return c
+
+    @staticmethod
+    def _mock_response(text="updated summary"):
+        m = MagicMock()
+        m.choices = [MagicMock()]
+        m.choices[0].message.content = text
+        return m
+
+    def test_budget_math(self):
+        c = self._make_compressor()
+        budget = c._summary_input_token_budget()
+        assert budget == self._CTX - self._MAX - ContextCompressor._SUMMARY_PROMPT_MARGIN_TOKENS
+        # A window with no known size is unworkable: no usable input budget.
+        c2 = self._make_compressor()
+        c2._resolved_context_length = 0
+        assert c2._summary_input_token_budget() == 0
+
+    def test_estimated_tokens_scales_with_calibration(self):
+        c = self._make_compressor()
+        text = "a" * 40_000  # 10,000 base tokens at chars/4
+        assert c._estimate_summary_input_tokens(text) == 10_000
+        c.token_estimate_scale_cfg = {"scale": 1.6}
+        assert c._estimate_summary_input_tokens(text) == 16_000
+
+    def test_summarizer_prompt_fits_window_budget(self):
+        """The assembled iterative prompt must stay inside
+        window - output_reservation - margin, even when the char caps alone
+        would overflow it (the 148,001-token repro)."""
+        c = self._make_compressor()
+        cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        # 320k-char blocks: the char cap alone leaves two 160k-char blocks
+        # (~160k estimated tokens), which overflows the 129,568-token budget.
+        c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
+        messages = [
+            {"role": "user", "content": "turn-%d-" % i + ("x" * 4000)}
+            for i in range(80)
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=self._mock_response()) as mock_call:
+            summary = c._generate_summary(messages)
+
+        assert summary.startswith(SUMMARY_PREFIX)
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        budget = c._summary_input_token_budget()
+        # The full assembled prompt (blocks + template + memory) must fit.
+        assert c._estimate_summary_input_tokens(prompt) <= budget, (
+            "summarizer prompt %d est. tokens exceeds budget %d "
+            "(window %d - reservation %d - margin %d)"
+            % (
+                c._estimate_summary_input_tokens(prompt),
+                budget,
+                self._CTX,
+                self._MAX,
+                ContextCompressor._SUMMARY_PROMPT_MARGIN_TOKENS,
+            )
+        )
+        # Tightening preserved each block's edges and left a visible marker.
+        assert "PREV_HEAD" in prompt
+        assert "PREV_TAIL" in prompt
+        assert "turn-0-" in prompt
+        assert "summary input" in prompt
+
+    def test_char_cap_still_binds_when_window_is_large(self):
+        """With a 272k window the char cap already keeps the prompt in budget;
+        the window budget must not over-shrink below the char cap (no
+        unnecessary tightening)."""
+        c = self._make_compressor()
+        c._resolved_context_length = 272_000
+        c._config_context_length = 272_000
+        c.context_length = 272_000
+        cap = ContextCompressor._SUMMARY_INPUT_MAX_CHARS
+        c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
+        messages = [
+            {"role": "user", "content": "turn-%d-" % i + ("x" * 6000)}
+            for i in range(80)
+        ]
+        with patch("agent.context_compressor.call_llm", return_value=self._mock_response()) as mock_call:
+            c._generate_summary(messages)
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # Both blocks still at the full char cap => the historical
+        # "...truncated..." marker, not the window-tightening marker.
+        assert "summary input truncated" in prompt
+        assert "summary input window-truncated" not in prompt
+        assert len(prompt) < 2 * cap + 30_000

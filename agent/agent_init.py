@@ -2574,6 +2574,7 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             small_ctx_floor=compression_small_ctx_floor,
+            token_estimate_scale_cfg=compression_token_estimate_scale_cfg,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
