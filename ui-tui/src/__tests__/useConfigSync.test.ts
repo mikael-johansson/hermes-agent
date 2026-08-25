@@ -336,7 +336,7 @@ describe('applyDisplay → voice.record_key (#18994)', () => {
     applyDisplay({ config: { display: {}, voice: { record_key: 'ctrl+space' } } }, setBell, setVoiceRecordKey)
 
     expect(setVoiceRecordKey).toHaveBeenCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'ctrl', named: 'space', raw: 'ctrl+space' })
+      expect.objectContaining({ ch: ' ', mod: 'ctrl', named: 'space', raw: 'ctrl+space' })
     )
   })
 
@@ -346,7 +346,9 @@ describe('applyDisplay → voice.record_key (#18994)', () => {
 
     applyDisplay({ config: { display: {} } }, setBell, setVoiceRecordKey)
 
-    expect(setVoiceRecordKey).toHaveBeenCalledWith(expect.objectContaining({ ch: 'b', mod: 'ctrl', raw: 'ctrl+b' }))
+    expect(setVoiceRecordKey).toHaveBeenCalledWith(
+      expect.objectContaining({ ch: ' ', mod: 'ctrl', named: 'space', raw: 'ctrl+space' })
+    )
   })
 
   it('is a no-op when the voice setter is not passed (back-compat)', () => {
@@ -501,19 +503,22 @@ describe('hydrateFullConfig', () => {
   })
 
   it('reapplies the latest value on each invocation (mtime-reload semantics)', async () => {
-    const gw = makeFakeGw({ config: { display: {}, voice: { record_key: 'ctrl+b' } } })
+    // ctrl+o as the initial custom binding: ctrl+b/ctrl+f are reserved
+    // for readline cursor movement and parseVoiceRecordKey falls back
+    // to the default for them, so they can't exercise a real re-apply.
+    const gw = makeFakeGw({ config: { display: {}, voice: { record_key: 'ctrl+o' } } })
     const setBell = vi.fn()
     const setVoiceRecordKey = vi.fn()
 
     await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
-    expect(setVoiceRecordKey).toHaveBeenLastCalledWith(expect.objectContaining({ ch: 'b' }))
+    expect(setVoiceRecordKey).toHaveBeenLastCalledWith(expect.objectContaining({ ch: 'o', mod: 'ctrl' }))
 
     // Simulate a config edit: gw now returns a new shortcut.
     gw.request = vi.fn(() => Promise.resolve({ config: { display: {}, voice: { record_key: 'alt+space' } } }))
 
     await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
     expect(setVoiceRecordKey).toHaveBeenLastCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'alt', named: 'space' })
+      expect.objectContaining({ ch: ' ', mod: 'alt', named: 'space', raw: 'alt+space' })
     )
   })
 

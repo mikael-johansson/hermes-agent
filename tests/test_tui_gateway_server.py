@@ -1315,7 +1315,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
         )
 
         assert (
-            status_resp["result"]["record_key"] == "ctrl+b"
+            status_resp["result"]["record_key"] == "ctrl+space"
         ), f"voice.record_key fell back to default for voice={bad!r}"
 
     # Round-4 follow-up: the YAML root itself may be a non-dict. A
@@ -1334,7 +1334,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
         )
 
         assert (
-            status_resp["result"]["record_key"] == "ctrl+b"
+            status_resp["result"]["record_key"] == "ctrl+space"
         ), f"voice.record_key fell back to default for root={bad_root!r}"
 
 
@@ -1955,7 +1955,7 @@ def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     """Round-2 Copilot review regression on #19835.
 
     The ``tts`` branch used to omit ``record_key`` from its response, so a
-    TUI client would parse ``r.record_key ?? 'ctrl+b'`` and reset a
+    TUI client would parse ``r.record_key ?? 'ctrl+space'`` and reset a
     custom binding to the default on every TTS toggle. Every branch of
     ``voice.toggle`` now carries the configured key so frontend state
     stays authoritative.

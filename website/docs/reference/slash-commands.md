@@ -84,7 +84,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/skin` | Show or change the display skin/theme |
 | `/statusbar` (alias: `/sb`) | Toggle the context/model status bar on or off |
 | `/battery [on\|off\|status]` | Toggle a color-coded battery read-out as the first status-bar element (off by default; no-op without a battery). |
-| `/voice [on\|off\|tts\|status]` | Toggle CLI voice mode and spoken playback. Recording uses `voice.record_key` (default: `Ctrl+B`). |
+| `/voice [on\|off\|tts\|status]` | Toggle CLI voice mode and spoken playback. Recording uses `voice.record_key` (default: `Ctrl+Space`). |
 | `/yolo` | Toggle YOLO mode — skip all dangerous command approval prompts. |
 | `/approvals [manual\|smart\|off]` | Show or set the persistent dangerous-command approval mode. |
 | `/footer [on\|off\|status]` | Toggle the gateway runtime-metadata footer on final replies (shows model, context %, and cwd). |

@@ -126,7 +126,8 @@ When resuming a previous session (`hermes -c` or `hermes --resume <id>`), a "Pre
 | `Alt+Enter`, `Ctrl+J`, or `Shift+Enter` | New line (multi-line input). `Shift+Enter` requires a terminal that distinguishes it from `Enter` — see below. On Windows Terminal, `Alt+Enter` is captured by the terminal (fullscreen toggle); use `Ctrl+Enter` or `Ctrl+J` instead. |
 | `Alt+V` | Paste an image from the clipboard when supported by the terminal |
 | `Ctrl+V` | Paste text and opportunistically attach clipboard images |
-| `Ctrl+B` | Start/stop voice recording when voice mode is enabled (`voice.record_key`, default: `ctrl+b`) |
+| `Ctrl+B` / `Ctrl+F` | Move the cursor back / forward one character (readline-style). `Alt+B` / `Alt+F` (or `Meta+B` / `Meta+F`) jump a whole word. |
+| `Ctrl+Space` | Start/stop voice recording when voice mode is enabled (`voice.record_key`, default: `ctrl+space`) |
 | `Ctrl+G` | Open the current input buffer in `$EDITOR` (vim/nvim/nano/VS Code/etc.). Save and quit to send the edited text as the next prompt — ideal for long, multi-paragraph prompts. |
 | `Ctrl+X Ctrl+E` | Emacs-style alternate binding for the external editor (same behavior as `Ctrl+G`). |
 | `Ctrl+S` | **Stash the prompt.** Parks the current draft and clears the composer so you can send something else first. Press `Ctrl+S` again on an empty composer to bring the draft back (cursor at the end, attached images restored). Repeated presses build a stack rather than overwriting, so an earlier draft is never silently lost — with two or more stashed, `Ctrl+S` opens a browse panel (`↑`/`↓` to navigate, `Enter` to restore, `D` to discard, `Esc` or `Ctrl+S` to close). A `📌 N` badge in the status bar shows how many drafts are parked. Multi-line drafts round-trip exactly, including blank lines. The stash lives in memory for the session only — nothing is written to disk, since drafts often contain secrets. |
@@ -173,7 +174,7 @@ Common examples:
 | `/skills browse` | Browse the skills hub and official optional skills |
 | `/background <prompt>` | Run a prompt in a separate background session |
 | `/skin` | Show or switch the active CLI skin |
-| `/voice on` | Enable CLI voice mode (press `Ctrl+B` to record) |
+| `/voice on` | Enable CLI voice mode (press `Ctrl+Space` to record) |
 | `/voice tts` | Toggle spoken playback for Hermes replies |
 | `/reasoning high` | Increase reasoning effort |
 | `/title My Session` | Name the current session |

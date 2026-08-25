@@ -32,7 +32,7 @@ A paid [Nous Portal](/user-guide/features/tool-gateway) subscription supplies th
 
 | Feature | Platform | Description |
 |---------|----------|-------------|
-| **Interactive Voice** | CLI | Press Ctrl+B to record, agent auto-detects silence and responds |
+| **Interactive Voice** | CLI | Press Ctrl+Space to record, agent auto-detects silence and responds |
 | **Auto Voice Reply** | Telegram, Discord | Agent sends spoken audio alongside text responses |
 | **Voice Channel** | Discord | Bot joins VC, listens to users speaking, speaks replies back |
 
@@ -134,7 +134,7 @@ Then use these commands inside the CLI:
 ### How It Works
 
 1. Start the CLI with `hermes` and enable voice mode with `/voice on`
-2. **Press Ctrl+B** — a beep plays (880Hz), recording starts
+2. **Press Ctrl+Space** — a beep plays (880Hz), recording starts
 3. **Speak** — a live audio level bar shows your input: `● [▁▂▃▅▇▇▅▂] ❯`
 4. **Stop speaking** — after 3 seconds of silence, recording auto-stops
 5. **Two beeps** play (660Hz) confirming the recording ended
@@ -142,10 +142,10 @@ Then use these commands inside the CLI:
 7. If TTS is enabled, the agent's reply is spoken aloud
 8. Recording **automatically restarts** — speak again without pressing any key
 
-This loop continues until you press **Ctrl+B** during recording (exits continuous mode) or 3 consecutive recordings detect no speech.
+This loop continues until you press **Ctrl+Space** during recording (exits continuous mode) or 3 consecutive recordings detect no speech.
 
 :::tip
-The record key is configurable via `voice.record_key` in `~/.hermes/config.yaml` (default: `ctrl+b`).
+The record key is configurable via `voice.record_key` in `~/.hermes/config.yaml` (default: `ctrl+space`). `Ctrl+B` and `Ctrl+F` are intentionally not voice keys — they move the cursor back/forward one character (readline-style), and `Alt`/`Meta`+`B`/`F` jump by word.
 :::
 
 ### Silence Detection
@@ -409,7 +409,7 @@ DISCORD_ALLOWED_USERS=284102345871466496
 ```yaml
 # Voice recording (CLI)
 voice:
-  record_key: "ctrl+b"            # Key to start/stop recording
+  record_key: "ctrl+space"         # Key to start/stop recording (default; ctrl+b/ctrl+f are reserved for cursor movement)
   max_recording_seconds: 120       # Maximum recording length
   auto_tts: false                  # Auto-enable TTS when voice mode starts
   beep_enabled: true               # Play record start/stop beeps

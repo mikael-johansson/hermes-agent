@@ -35,7 +35,7 @@ from typing import Any, Callable, Optional
 # ``super``/``win``/``windows`` are intentionally absent: prompt_toolkit
 # has no super/meta modifier for the Cmd key, so those spellings are
 # TUI-only. The normalizer below returns the documented default
-# (``c-b``) for them — a silent fallback was preferred to a hard
+# (``c-space``) for them — a silent fallback was preferred to a hard
 # startup crash (Copilot round-11). The CLI binding site
 # (``_register_voice_handler`` in cli.py) logs a warning when that
 # fallback fires so users see why their TUI-only shortcut isn't
@@ -71,17 +71,30 @@ _VOICE_NAMED_KEYS = {
 # so a binding like ``ctrl+c`` (interrupt), ``ctrl+d`` (quit), or
 # ``ctrl+l`` (clear screen) would be advertised in /voice status but
 # never fire push-to-talk — the same blocklist the TUI parser uses.
-_VOICE_RESERVED_CTRL_CHARS = frozenset({"c", "d", "l"})
+#
+# ``b`` / ``f`` are also reserved: they are readline's backward-char /
+# forward-char cursor keys and the composer claims them for cursor
+# movement, so a voice binding on either would be advertised in /voice
+# status but never fire push-to-talk (same rationale as above).
+_VOICE_RESERVED_CTRL_CHARS = frozenset({"c", "d", "l", "b", "f"})
 
 # On macOS the classic CLI's prompt_toolkit bindings for copy / exit /
 # clear also claim ``a-c`` / ``a-d`` / ``a-l`` via the action-modifier
 # lookup, and hermes-ink reports Alt as ``key.meta`` on many terminals.
 # Mirror the TUI parser's darwin-only reservation so ``option+c`` etc.
 # don't bind Alt+C in the CLI while the TUI silently falls back to
-# Ctrl+B (Copilot round-14 on #19835).
+# Ctrl+Space (Copilot round-14 on #19835).
 _VOICE_RESERVED_ALT_CHARS_MAC = frozenset({"c", "d", "l"})
 
-_DEFAULT_PT_KEY = "c-b"
+# Documented default: Ctrl+Space. Chosen over the historical Ctrl+B
+# because Ctrl+B is readline's backward-char cursor key and the composer
+# claims it for cursor movement — a voice binding there would be
+# advertised in /voice status but never fire push-to-talk. Ctrl+Space is
+# a *named* key (``c-space``) that prompt_toolkit binds cleanly and is
+# the conventional push-to-talk chord, so it works in both the TUI
+# (``ctrl+space`` → ``ch===' '`` with the ctrl bit) and the CLI
+# (``c-space``).
+_DEFAULT_PT_KEY = "c-space"
 
 
 def voice_record_key_from_config(cfg: Any) -> Any:
@@ -113,11 +126,11 @@ def normalize_voice_record_key_for_prompt_toolkit(raw: Any) -> str:
     so one config value binds the same shortcut in both runtimes:
 
     * non-string / empty / typo'd / bare-char / multi-modifier / reserved
-      ``ctrl+c|d|l`` → documented default ``c-b``
+      ``ctrl+c|d|l|b|f`` → documented default ``c-space``
     * single-char keys: ``ctrl+o`` → ``c-o``
     * named keys: ``ctrl+space`` → ``c-space`` (aliases collapse:
       ``ctrl+return`` → ``c-enter``)
-    * ``super`` / ``win`` / ``windows`` → ``c-b`` (TUI-only modifiers —
+    * ``super`` / ``win`` / ``windows`` → ``c-space`` (TUI-only modifiers —
       prompt_toolkit has no super mod; the CLI binding site is
       expected to warn when this fallback fires so users see the
       cross-runtime split, Copilot round-11 on #19835)
@@ -186,7 +199,7 @@ def normalize_voice_record_key_for_prompt_toolkit(raw: Any) -> str:
 def format_voice_record_key_for_status(raw: Any) -> str:
     """Render ``voice.record_key`` for ``/voice status`` in CLI-friendly form.
 
-    Mirrors the TUI's ``formatVoiceRecordKey``: returns ``Ctrl+B`` /
+    Mirrors the TUI's ``formatVoiceRecordKey``: returns ``Ctrl+Space`` /
     ``Alt+Space`` / ``Ctrl+Enter``. Malformed configs surface as the
     documented default so status never advertises a shortcut that
     won't bind (Copilot round-10 on #19835).
@@ -203,7 +216,7 @@ def format_voice_record_key_for_status(raw: Any) -> str:
         mod, key = normalized.split("+", 1)
         prefix = mod[0].upper() + mod[1:] + "+"
     else:
-        return "Ctrl+B"
+        return "Ctrl+Space"
 
     if not key:
         return prefix.rstrip("+")
@@ -1043,7 +1056,8 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         _tts_playing.set()
         _debug("speak_text: TTS done")
 
-        # Re-arm the mic so the user can answer without pressing Ctrl+B.
+        # Re-arm the mic so the user can answer without pressing the
+        # push-to-talk key (default Ctrl+Space).
         # Small delay lets the OS flush speaker output and afplay fully
         # release the audio device before sounddevice re-opens the input.
         if paused_recording:

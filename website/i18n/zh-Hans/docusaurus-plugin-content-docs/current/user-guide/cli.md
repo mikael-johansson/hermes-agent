@@ -98,7 +98,8 @@ hermes -w -z "Fix issue #123"     # 在 worktree 中以单次查询模式运行
 | `Alt+Enter`、`Ctrl+J` 或 `Shift+Enter` | 换行（多行输入）。`Shift+Enter` 需要终端能够将其与 `Enter` 区分——见下文。在 Windows Terminal 中，`Alt+Enter` 被终端捕获（切换全屏）；请改用 `Ctrl+Enter` 或 `Ctrl+J`。 |
 | `Alt+V` | 在终端支持时从剪贴板粘贴图片 |
 | `Ctrl+V` | 粘贴文本，并尝试附加剪贴板中的图片 |
-| `Ctrl+B` | 语音模式启用时开始/停止录音（`voice.record_key`，默认：`ctrl+b`） |
+| `Ctrl+B` / `Ctrl+F` | 光标向前 / 向后移动一个字符（readline 风格）。`Alt+B` / `Alt+F`（或 `Meta+B` / `Meta+F`）按单词跳转。 |
+| `Ctrl+Space` | 语音模式启用时开始/停止录音（`voice.record_key`，默认：`ctrl+space`） |
 | `Ctrl+G` | 在 `$EDITOR`（vim/nvim/nano/VS Code 等）中打开当前输入缓冲区。保存并退出后，编辑后的文本将作为下一条 prompt 发送——适合编写长篇多段落 prompt。 |
 | `Ctrl+X Ctrl+E` | 外部编辑器的 Emacs 风格备用绑定（与 `Ctrl+G` 行为相同）。 |
 | `Ctrl+C` | 中断 agent（2 秒内双击强制退出） |
@@ -124,7 +125,7 @@ hermes -w -z "Fix issue #123"     # 在 worktree 中以单次查询模式运行
 | `/skills browse` | 浏览 skill 中心和官方可选 skill |
 | `/background <prompt>` | 在独立后台会话中运行一个 prompt |
 | `/skin` | 显示或切换当前 CLI 皮肤 |
-| `/voice on` | 启用 CLI 语音模式（按 `Ctrl+B` 录音） |
+| `/voice on` | 启用 CLI 语音模式（按 `Ctrl+Space` 录音） |
 | `/voice tts` | 切换 Hermes 回复的语音播放 |
 | `/reasoning high` | 提高推理强度 |
 | `/title My Session` | 为当前会话命名 |

@@ -1617,7 +1617,10 @@ DEFAULT_CONFIG = {
     },
 
     "voice": {
-        "record_key": "ctrl+b",
+        # Ctrl+Space (not Ctrl+B) — Ctrl+B is readline's backward-char cursor
+        # key and the composer needs it for cursor movement. See
+        # hermes_cli/voice.py for the full rationale.
+        "record_key": "ctrl+space",
         "max_recording_seconds": 120,
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode

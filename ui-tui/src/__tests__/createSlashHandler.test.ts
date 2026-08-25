@@ -557,7 +557,7 @@ describe('createSlashHandler', () => {
       expect(ctx.transcript.sys).toHaveBeenCalledWith('  Record key: Ctrl+Space')
     })
     expect(ctx.voice.setVoiceRecordKey).toHaveBeenCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'ctrl', named: 'space' })
+      expect.objectContaining({ ch: ' ', mod: 'ctrl', named: 'space' })
     )
   })
 
@@ -573,20 +573,20 @@ describe('createSlashHandler', () => {
     expect(ctx.voice.setVoiceRecordKey).toHaveBeenCalledWith(expect.objectContaining({ ch: 'r', mod: 'alt' }))
   })
 
-  it('/voice falls back to Ctrl+B when the gateway response omits record_key', async () => {
+  it('/voice falls back to Ctrl+Space when the gateway response omits record_key', async () => {
     const rpc = vi.fn(() => Promise.resolve({ enabled: false, tts: false }))
     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
 
     expect(createSlashHandler(ctx)('/voice status')).toBe(true)
     await vi.waitFor(() => {
-      expect(ctx.transcript.sys).toHaveBeenCalledWith('  Record key: Ctrl+B')
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('  Record key: Ctrl+Space')
     })
   })
 
   // Round-2 Copilot review on #19835: a response missing ``record_key``
   // (e.g. the old tts branch, or any future branch that forgets to
-  // include it) MUST NOT clobber the user's cached binding back to
-  // Ctrl+B. The label still renders the default for display; the
+  // include it) MUST NOT clobber the user's cached binding back to the
+  // default. The label still renders the default for display; the
   // frontend state keeps whatever was last authoritatively set.
   it('/voice tts without record_key does not clobber cached frontend binding', async () => {
     const rpc = vi.fn(() => Promise.resolve({ enabled: true, tts: true }))

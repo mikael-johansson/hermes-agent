@@ -44,10 +44,10 @@ class TestNormalizeVoiceRecordKeyForPromptToolkit:
     def test_non_string_falls_back_to_default(self):
         from hermes_cli.voice import normalize_voice_record_key_for_prompt_toolkit
 
-        assert normalize_voice_record_key_for_prompt_toolkit(None) == "c-b"
-        assert normalize_voice_record_key_for_prompt_toolkit(1) == "c-b"
-        assert normalize_voice_record_key_for_prompt_toolkit(True) == "c-b"
-        assert normalize_voice_record_key_for_prompt_toolkit({}) == "c-b"
+        assert normalize_voice_record_key_for_prompt_toolkit(None) == "c-space"
+        assert normalize_voice_record_key_for_prompt_toolkit(1) == "c-space"
+        assert normalize_voice_record_key_for_prompt_toolkit(True) == "c-space"
+        assert normalize_voice_record_key_for_prompt_toolkit({}) == "c-space"
 
 
     def test_super_win_fall_back_to_default_in_cli(self):
@@ -58,9 +58,9 @@ class TestNormalizeVoiceRecordKeyForPromptToolkit:
         (Copilot round-11 on #19835)."""
         from hermes_cli.voice import normalize_voice_record_key_for_prompt_toolkit
 
-        assert normalize_voice_record_key_for_prompt_toolkit("super+b") == "c-b"
-        assert normalize_voice_record_key_for_prompt_toolkit("win+o") == "c-b"
-        assert normalize_voice_record_key_for_prompt_toolkit("windows+o") == "c-b"
+        assert normalize_voice_record_key_for_prompt_toolkit("super+b") == "c-space"
+        assert normalize_voice_record_key_for_prompt_toolkit("win+o") == "c-space"
+        assert normalize_voice_record_key_for_prompt_toolkit("windows+o") == "c-space"
 
     # Round-10 Copilot review regressions on #19835.
 
@@ -71,7 +71,7 @@ class TestNormalizeVoiceRecordKeyForPromptToolkit:
     # ``key.meta`` and isActionMod(darwin) accepts it. The CLI
     # normalizer must mirror that platform-gated rejection so shared
     # configs like ``option+c`` don't bind Alt+C in the CLI while the
-    # TUI falls back to Ctrl+B.
+    # TUI falls back to Ctrl+Space.
 
 
 class TestVoiceRecordKeyFromConfig:
@@ -96,7 +96,7 @@ class TestVoiceRecordKeyFromConfig:
 
     def test_normalizer_accepts_extractor_output_directly(self):
         """voice_record_key_from_config + normalize_… must compose —
-        None / non-string scalars all fall back to c-b."""
+        None / non-string scalars all fall back to c-space."""
         from hermes_cli.voice import (
             normalize_voice_record_key_for_prompt_toolkit,
             voice_record_key_from_config,
@@ -104,7 +104,7 @@ class TestVoiceRecordKeyFromConfig:
 
         for raw in (None, True, 1, "cmd+b", ["ctrl+b"]):
             extracted = voice_record_key_from_config({"voice": raw})
-            assert normalize_voice_record_key_for_prompt_toolkit(extracted) == "c-b"
+            assert normalize_voice_record_key_for_prompt_toolkit(extracted) == "c-space"
 
 
 class TestFormatVoiceRecordKeyForStatus:
@@ -112,37 +112,46 @@ class TestFormatVoiceRecordKeyForStatus:
 
     ``/voice status`` used to print the raw scalar (``True`` / ``1``)
     for non-string configs even though the actual binding falls back
-    to Ctrl+B. The formatter routes through the same normalizer so
+    to Ctrl+Space. The formatter routes through the same normalizer so
     status always matches what the CLI actually binds.
     """
 
     def test_ctrl_and_alt_letter_keys_render_canonically(self):
         from hermes_cli.voice import format_voice_record_key_for_status
 
-        assert format_voice_record_key_for_status("ctrl+b") == "Ctrl+B"
+        # ctrl+b / ctrl+f are reserved (readline cursor movement) and are
+        # covered by test_ctrl_b_and_ctrl_f_are_reserved_not_voice below.
         assert format_voice_record_key_for_status("ctrl+o") == "Ctrl+O"
         assert format_voice_record_key_for_status("alt+r") == "Alt+R"
+        assert format_voice_record_key_for_status("ctrl+space") == "Ctrl+Space"
 
+    def test_ctrl_b_and_ctrl_f_are_reserved_not_voice(self):
+        """ctrl+b / ctrl+f are readline cursor-movement keys reserved by
+        the composer; they are rejected as voice bindings and fall back
+        to the default Ctrl+Space (same blocklist as the TUI parser)."""
+        from hermes_cli.voice import format_voice_record_key_for_status
 
+        assert format_voice_record_key_for_status("ctrl+b") == "Ctrl+Space"
+        assert format_voice_record_key_for_status("ctrl+f") == "Ctrl+Space"
 
-    def test_non_string_scalar_falls_back_to_ctrl_b_label(self):
+    def test_non_string_scalar_falls_back_to_ctrl_space_label(self):
         from hermes_cli.voice import format_voice_record_key_for_status
 
         # Copilot round-10 regression: previously /voice status printed
         # the raw scalar ("True" / "1") even though the actual binding
-        # fell back to Ctrl+B.
-        assert format_voice_record_key_for_status(True) == "Ctrl+B"
-        assert format_voice_record_key_for_status(1) == "Ctrl+B"
-        assert format_voice_record_key_for_status(None) == "Ctrl+B"
-        assert format_voice_record_key_for_status({}) == "Ctrl+B"
+        # fell back to the documented default (Ctrl+Space).
+        assert format_voice_record_key_for_status(True) == "Ctrl+Space"
+        assert format_voice_record_key_for_status(1) == "Ctrl+Space"
+        assert format_voice_record_key_for_status(None) == "Ctrl+Space"
+        assert format_voice_record_key_for_status({}) == "Ctrl+Space"
 
-    def test_malformed_configs_fall_back_to_ctrl_b(self):
+    def test_malformed_configs_fall_back_to_ctrl_space(self):
         from hermes_cli.voice import format_voice_record_key_for_status
 
-        assert format_voice_record_key_for_status("ctrl+spcae") == "Ctrl+B"
-        assert format_voice_record_key_for_status("ctrl+alt+r") == "Ctrl+B"
-        assert format_voice_record_key_for_status("") == "Ctrl+B"
-        assert format_voice_record_key_for_status("  ") == "Ctrl+B"
+        assert format_voice_record_key_for_status("ctrl+spcae") == "Ctrl+Space"
+        assert format_voice_record_key_for_status("ctrl+alt+r") == "Ctrl+Space"
+        assert format_voice_record_key_for_status("") == "Ctrl+Space"
+        assert format_voice_record_key_for_status("  ") == "Ctrl+Space"
 
 
 class TestStopWithoutStart:

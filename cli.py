@@ -6007,7 +6007,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
           placeholder invalidated every 150ms during recording), so
           reading config on every call added avoidable UI overhead.
         """
-        return getattr(self, "_voice_record_key_display_cache", None) or "Ctrl+B"
+        return getattr(self, "_voice_record_key_display_cache", None) or "Ctrl+Space"
 
     def set_voice_record_key_cache(self, raw_key: object) -> None:
         """Populate the voice label cache from a raw ``voice.record_key``.
@@ -6019,7 +6019,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.voice import format_voice_record_key_for_status
             self._voice_record_key_display_cache = format_voice_record_key_for_status(raw_key)
         except Exception:
-            self._voice_record_key_display_cache = "Ctrl+B"
+            self._voice_record_key_display_cache = "Ctrl+Space"
 
     def _get_voice_status_fragments(self, width: Optional[int] = None):
         """Return the voice status bar fragments for the interactive TUI."""
@@ -12695,8 +12695,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _voice_stop_and_transcribe(self):
         """Stop recording, transcribe via STT, and queue the transcript as input."""
         # Atomic guard: only one thread can enter stop-and-transcribe.
-        # Set _voice_processing immediately so concurrent Ctrl+B presses
-        # don't race into the START path while recorder.stop() holds its lock.
+        # Set _voice_processing immediately so concurrent push-to-talk
+        # presses (default Ctrl+Space) don't race into the START path
+        # while recorder.stop() holds its lock.
         with self._voice_lock:
             if not self._voice_recording:
                 return
@@ -16460,7 +16461,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             run_in_terminal(_suspend)
 
         # Voice push-to-talk key: configurable via config.yaml (voice.record_key)
-        # Default: Ctrl+B (avoids conflict with Ctrl+R readline reverse-search).
+        # Default: Ctrl+Space (avoids conflict with Ctrl+B, readline's
+        # backward-char cursor key, which the composer uses for cursor movement).
         # Config spellings (ctrl/control/alt/option/opt) are normalized to
         # prompt_toolkit's c-x / a-x format via ``normalize_voice_record_key_for_prompt_toolkit``
         # so the same config value binds identically in the TUI and CLI
@@ -16468,7 +16470,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # configs silently fall back to the default here since prompt_toolkit
         # has no super modifier — log a warning so users notice the
         # TUI/CLI split instead of a silent mismatch (round-11).
-        _raw_key: object = "ctrl+b"
+        _raw_key: object = "ctrl+space"
         try:
             from hermes_cli.config import load_config
             from hermes_cli.voice import (
@@ -16480,16 +16482,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if (
                 isinstance(_raw_key, str)
                 and _raw_key.strip().lower().split("+", 1)[0].strip() in {"super", "win", "windows"}
-                and _voice_key == "c-b"
+                and _voice_key == "c-space"
             ):
                 logger.warning(
                     "voice.record_key %r uses a TUI-only modifier (super/win); "
-                    "CLI fell back to Ctrl+B. Use ctrl+<key> or alt+<key> for "
+                    "CLI fell back to Ctrl+Space. Use ctrl+<key> or alt+<key> for "
                     "cross-runtime parity.",
                     _raw_key,
                 )
         except Exception:
-            _voice_key = "c-b"
+            _voice_key = "c-space"
 
         # Cache the UI label here — same ``_raw_key`` that drives the
         # prompt_toolkit binding below. Every status / placeholder /

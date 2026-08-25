@@ -187,7 +187,7 @@ TIPS = [
     # --- Voice ---
     "Voice mode works with zero API keys if faster-whisper is installed (free local speech-to-text).",
     "Five TTS providers available: Edge TTS (free), ElevenLabs, OpenAI, NeuTTS (free local), MiniMax.",
-    "/voice on enables voice mode in the CLI. Ctrl+B toggles push-to-talk recording.",
+    "/voice on enables voice mode in the CLI. Ctrl+Space toggles push-to-talk recording.",
     "Streaming TTS plays sentences as they generate — you don't wait for the full response.",
     "Voice messages on Telegram, Discord, WhatsApp, and Slack are auto-transcribed.",
 
@@ -322,7 +322,7 @@ TIPS = [
     "Audio level visualization shows ▁▂▃▄▅▆▇ bars during voice recording based on microphone RMS levels.",
     "Profile names cannot collide with existing PATH binaries — 'hermes profile create ls' would be rejected.",
     "hermes profile create backup --clone-all copies everything (config, keys, SOUL.md, memories, skills, sessions).",
-    "The voice record key is configurable via voice.record_key in config.yaml — not just Ctrl+B.",
+    "The voice record key is configurable via voice.record_key in config.yaml — not just Ctrl+Space.",
     ".cursorrules and .cursor/rules/*.mdc files are auto-detected and loaded as project context.",
     "Context files support 10+ prompt injection patterns — invisible Unicode, 'ignore instructions', exfil attempts.",
     "GPT-5 and Codex use 'developer' role instead of 'system' in the message format.",

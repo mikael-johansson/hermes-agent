@@ -13421,7 +13421,7 @@ def _voice_record_key() -> str:
     """Current ``voice.record_key`` value, documented default on error."""
     record_key = _voice_cfg_dict().get("record_key")
 
-    return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+b"
+    return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+space"
 
 
 # ── Wake word ("Hey Hermes") ──────────────────────────────────────────────
@@ -13860,7 +13860,8 @@ def _(rid, params: dict) -> dict:
     * ``on`` / ``off`` — flip voice *mode* (the umbrella bit). Turning it
       off also tears down any active continuous recording loop. Does NOT
       start recording on its own; recording is driven by ``voice.record``
-      (Ctrl+B) after mode is on, matching cli.py's enable/Ctrl+B split.
+      (default Ctrl+Space, configurable via ``voice.record_key``) after
+      mode is on, matching cli.py's enable/record split.
     * ``tts`` — toggle speech-output of agent replies. Requires mode on
       (mirrors CLI's _toggle_voice_tts guard).
     """
@@ -13872,8 +13873,8 @@ def _(rid, params: dict) -> dict:
         # isn't working ("STT provider: MISSING ..." is the common case).
         # ``record_key`` mirrors the configured ``voice.record_key`` so the
         # TUI can both bind it (frontend ``isVoiceToggleKey``) and display
-        # it in /voice status — previously the TUI hardcoded Ctrl+B and
-        # ignored the config (#18994).
+        # it in /voice status — previously the TUI hardcoded the default
+        # and ignored the config (#18994).
         payload: dict = {
             "enabled": _voice_mode_enabled(),
             "record_key": _voice_record_key(),

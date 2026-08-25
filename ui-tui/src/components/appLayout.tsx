@@ -431,6 +431,7 @@ const ComposerPane = memo(function ComposerPane({
                   // toward the resolved surface inherits that wrong polarity.
                   placeholderColor={ui.theme.color.muted}
                   value={composer.input}
+                  voiceEnabled={composer.voiceEnabled}
                   voiceRecordKey={composer.voiceRecordKey}
                 />
               </Box>

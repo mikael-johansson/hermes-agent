@@ -11,7 +11,7 @@ import type {
   SlashExecResponse,
   VoiceToggleResponse
 } from '../../../gatewayTypes.js'
-import { formatVoiceRecordKey, parseVoiceRecordKey } from '../../../lib/platform.js'
+import { DEFAULT_VOICE_RECORD_KEY, formatVoiceRecordKey, parseVoiceRecordKey } from '../../../lib/platform.js'
 import { fmtK } from '../../../lib/text.js'
 import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
@@ -329,7 +329,7 @@ export const sessionCommands: SlashCommand[] = [
             ctx.voice.setVoiceRecordKey(parsed)
           }
 
-          const recordKeyLabel = formatVoiceRecordKey(parsed ?? parseVoiceRecordKey('ctrl+b'))
+          const recordKeyLabel = formatVoiceRecordKey(parsed ?? DEFAULT_VOICE_RECORD_KEY)
 
           // Match CLI's _show_voice_status / _enable_voice_mode /
           // _toggle_voice_tts output shape so users don't have to learn

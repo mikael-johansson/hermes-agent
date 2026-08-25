@@ -263,7 +263,7 @@ uv pip install --python ./venv/bin/python -e ".[voice]"
 # 包含 faster-whisper，用于免费的本地语音转文字
 ```
 
-然后在 CLI 中输入：`/voice on`。按 `Ctrl+B` 开始录音。参阅 [语音模式](../user-guide/features/voice-mode.md)。
+然后在 CLI 中输入：`/voice on`。按 `Ctrl+Space` 开始录音。参阅 [语音模式](../user-guide/features/voice-mode.md)。
 
 ### Skills
 

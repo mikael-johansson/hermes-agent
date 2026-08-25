@@ -161,7 +161,7 @@ python -m pip install -U neutts[all]
 
 ```yaml
 voice:
-  record_key: "ctrl+b"
+  record_key: "ctrl+space"
   max_recording_seconds: 120
   auto_tts: false
   beep_enabled: true
@@ -212,10 +212,10 @@ hermes
 ### 录音流程
 
 默认按键：
-- `Ctrl+B`
+- `Ctrl+Space`
 
 工作流程：
-1. 按下 `Ctrl+B`
+1. 按下 `Ctrl+Space`
 2. 说话
 3. 等待静音检测自动停止录音
 4. Hermes 转录并回复
@@ -282,11 +282,11 @@ voice:
 
 ### 录音按键
 
-如果 `Ctrl+B` 与你的终端或 tmux 习惯冲突：
+如果 `Ctrl+Space` 与你的终端、tmux 或系统习惯冲突（例如 macOS Spotlight 也绑定了 Cmd/Ctrl+Space）：
 
 ```yaml
 voice:
-  record_key: "ctrl+space"
+  record_key: "alt+space"
 ```
 
 ## 使用场景二：Telegram 或 Discord 中的语音回复

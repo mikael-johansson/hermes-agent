@@ -281,10 +281,11 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
   }
 
-  // CLI parity: Ctrl+B toggles a VAD-bounded push-to-talk capture
+  // CLI parity: the configured record key (Ctrl+Space by default)
+  // toggles a VAD-bounded push-to-talk capture
   // (NOT the voice-mode umbrella bit). The mode is enabled via /voice on;
-  // Ctrl+B while the mode is off sys-nudges the user. While the mode is
-  // on, the first press starts a single VAD-bounded capture
+  // the record key while the mode is off sys-nudges the user. While the
+  // mode is on, the first press starts a single VAD-bounded capture
   // (gateway -> start_continuous(auto_restart=false), VAD auto-stop ->
   // transcribe -> idle), a subsequent press stops and transcribes it.
   // The gateway publishes voice.status + voice.transcript events that

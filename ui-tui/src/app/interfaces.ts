@@ -573,6 +573,7 @@ export interface AppLayoutComposerProps {
   queuedDisplay: string[]
   submit: (value: string) => void
   updateInput: StateSetter<string>
+  voiceEnabled: boolean
   voiceRecordKey: ParsedVoiceRecordKey
 }
 

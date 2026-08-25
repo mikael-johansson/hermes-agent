@@ -30,7 +30,7 @@ Hermes Agent 支持在 CLI 和消息平台上进行完整的语音交互。通�
 
 | 功能 | 平台 | 说明 |
 |---------|----------|-------------|
-| **交互式语音** | CLI | 按 Ctrl+B 开始录音，Agent 自动检测静音并回复 |
+| **交互式语音** | CLI | 按 Ctrl+Space 开始录音，Agent 自动检测静音并回复 |
 | **自动语音回复** | Telegram、Discord | Agent 在文字回复的同时发送语音音频 |
 | **语音频道** | Discord | Bot 加入语音频道，监听用户发言并语音回复 |
 
@@ -132,7 +132,7 @@ hermes                # 启动交互式 CLI
 ### 工作原理
 
 1. 使用 `hermes` 启动 CLI，并通过 `/voice on` 启用语音模式
-2. **按下 Ctrl+B** — 播放提示音（880Hz），开始录音
+2. **按下 Ctrl+Space** — 播放提示音（880Hz），开始录音
 3. **开始说话** — 实时音频电平条显示输入状态：`● [▁▂▃▅▇▇▅▂] ❯`
 4. **停止说话** — 静音 3 秒后自动停止录音
 5. **两声提示音**（660Hz）确认录音结束
@@ -140,10 +140,10 @@ hermes                # 启动交互式 CLI
 7. 如果启用了 TTS，Agent 的回复将以语音朗读
 8. 录音**自动重新开始** — 无需按任何键即可继续说话
 
-此循环持续进行，直到在录音过程中按下 **Ctrl+B**（退出连续模式），或连续 3 次录音均未检测到语音为止。
+此循环持续进行，直到在录音过程中按下 **Ctrl+Space**（退出连续模式），或连续 3 次录音均未检测到语音为止。
 
 :::tip
-录音键可通过 `~/.hermes/config.yaml` 中的 `voice.record_key` 配置（默认：`ctrl+b`）。
+录音键可通过 `~/.hermes/config.yaml` 中的 `voice.record_key` 配置（默认：`ctrl+space`）。`Ctrl+B` 和 `Ctrl+F` 刻意不作为语音键——它们用于向前/向后移动一个字符（readline 风格），`Alt`/`Meta`+`B`/`F` 按单词跳转。
 :::
 
 ### 静音检测
@@ -386,7 +386,7 @@ DISCORD_ALLOWED_USERS=284102345871466496
 ```yaml
 # 语音录制（CLI）
 voice:
-  record_key: "ctrl+b"            # 开始/停止录音的按键
+  record_key: "ctrl+space"      # 开始/停止录音的按键（默认；ctrl+b/ctrl+f 保留用于光标移动）
   max_recording_seconds: 120       # 最大录音时长
   auto_tts: false                  # 启用语音模式时自动开启 TTS
   beep_enabled: true               # 播放录音开始/结束提示音
