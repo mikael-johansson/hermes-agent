@@ -618,6 +618,7 @@ export function TextInput({
   mask,
   mouseApiRef,
   voiceRecordKey = DEFAULT_VOICE_RECORD_KEY,
+  voiceEnabled = false,
   placeholder = '',
   placeholderColor,
   color,
@@ -1100,8 +1101,28 @@ export function TextInput({
       // actually get voice toggled instead of a paste (Copilot round-7
       // follow-up on #19835). The pass-through predicate is a no-op for
       // ordinary typing and plain paste when voice is unbound to 'v'.
-      if (shouldPassThroughToGlobalHandler(inp, k, voiceRecordKey)) {
+      //
+      // The voice check is gated on `voiceEnabled`: while voice mode is OFF
+      // the configured key (default Ctrl+Space) is NOT the record key — it
+      // is ordinary input that the composer must handle itself (a plain
+      // space). Passing it to the global handler instead would swallow the
+      // keystroke and print "voice: mode is off", so we only let it through
+      // when /voice on is active.
+      if (voiceEnabled && shouldPassThroughToGlobalHandler(inp, k, voiceRecordKey)) {
         flushKeyBurst()
+
+        return
+      }
+
+      // Ctrl+B / Ctrl+F are readline's backward-char / forward-char cursor
+      // keys (not part of the voice binding — that's the default Ctrl+Space).
+      // Claim them at the composer level so they move by single character
+      // (Alt/Meta+B/F keep word movement); passing them through would let
+      // the global handler treat them as printable chars and type "b"/"f".
+      if (k.ctrl && !k.meta && !k.super && (inp.toLowerCase() === 'b' || inp.toLowerCase() === 'f')) {
+        flushKeyBurst()
+        const pos = inp.toLowerCase() === 'b' ? prevPos(vRef.current, curRef.current) : nextPos(vRef.current, curRef.current)
+        moveCursor(pos, k.shift)
 
         return
       }
@@ -1503,6 +1524,12 @@ interface TextInputProps {
   placeholderColor?: string
   value: string
   voiceRecordKey?: ParsedVoiceRecordKey
+  /**
+   * Whether voice mode is active (`/voice on`). Only while enabled does the
+   * configured voice key (default Ctrl+Space) route to the global push-to-talk
+   * handler; otherwise it's treated as ordinary composer input (a space).
+   */
+  voiceEnabled?: boolean
 }
 
 export type RightClickDecision = { action: 'copy'; text: string } | { action: 'paste' }

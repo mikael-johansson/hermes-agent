@@ -1365,7 +1365,7 @@ STT_OPENAI_BASE_URL=https://api.openai.com/v1
 
 ```yaml
 voice:
-  record_key: "ctrl+b"         # CLI 内的按键通话键
+  record_key: "ctrl+space"      # CLI 内的按键通话键
   max_recording_seconds: 120    # 长录音的硬停止
   auto_tts: false               # /voice on 时自动启用口语回复
   beep_enabled: true            # 在 CLI 语音模式中播放录音开始/停止提示音

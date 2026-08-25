@@ -187,12 +187,12 @@ class TestCLIStatusBar:
 
         fragments = cli_obj._get_voice_status_fragments(width=50)
 
-        assert fragments == [("class:voice-status", " 🎤 Ctrl+B ")]
+        assert fragments == [("class:voice-status", " 🎤 Ctrl+Space ")]
 
 
     # Round-13 Copilot review regressions on #19835. The label in voice
     # status bar / recording hint / placeholder must render the
-    # configured ``voice.record_key`` — not hardcoded Ctrl+B. Pinning
+    # configured ``voice.record_key`` — not a hardcoded default. Pinning
     # the cache (``set_voice_record_key_cache``) keeps display in sync
     # with the prompt_toolkit binding without re-reading config on
     # every render.

@@ -31,9 +31,14 @@ describe('shouldPassThroughToGlobalHandler', () => {
     ).toBe(true)
   })
 
-  it('keeps the legacy default pass-through when no custom key is provided', () => {
-    expect(shouldPassThroughToGlobalHandler('b', key({ ctrl: true }), DEFAULT_VOICE_RECORD_KEY)).toBe(true)
-    expect(shouldPassThroughToGlobalHandler('b', key({ ctrl: true }))).toBe(true)
+  it('keeps the default pass-through when no custom key is provided', () => {
+    // Default is Ctrl+Space now; Ctrl+B/F are reserved for readline
+    // cursor movement and no longer belong to the voice pass-through.
+    expect(shouldPassThroughToGlobalHandler(' ', key({ ctrl: true }), DEFAULT_VOICE_RECORD_KEY)).toBe(true)
+    expect(shouldPassThroughToGlobalHandler(' ', key({ ctrl: true }))).toBe(true)
+    // Ctrl+B is NOT a voice shortcut anymore — it stays in the composer.
+    expect(shouldPassThroughToGlobalHandler('b', key({ ctrl: true }), DEFAULT_VOICE_RECORD_KEY)).toBe(false)
+    expect(shouldPassThroughToGlobalHandler('f', key({ ctrl: true }))).toBe(false)
   })
 
   it('does not swallow ordinary typing keys', () => {

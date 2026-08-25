@@ -52,15 +52,17 @@ export const isCopyShortcut = (
 
 /**
  * Voice recording toggle key — configurable via ``voice.record_key`` in
- * ``config.yaml`` (default ``ctrl+b``).
+ * ``config.yaml`` (default ``ctrl+space``).
  *
  * Documented in tips.py, the Python CLI prompt_toolkit handler, and the
  * config.yaml default. The TUI honours the same config knob (#18994);
  * when ``voice.record_key`` is e.g. ``ctrl+o`` the TUI binds Ctrl+O.
  *
- * Only the documented default (``ctrl+b``) additionally accepts the
- * macOS action modifier (Cmd+B) — custom bindings like ``ctrl+o``
- * require the literal Ctrl bit so Cmd+O can't steal the shortcut.
+ * The default is ``ctrl+space`` (not ``ctrl+b``) because Ctrl+B is
+ * readline's backward-character cursor key and must remain free for the
+ * composer. Only the documented default additionally accepts the macOS
+ * action modifier (Cmd+Space) — custom bindings like ``ctrl+o`` require
+ * the literal Ctrl bit so Cmd+O can't steal the shortcut.
  */
 export type VoiceRecordKeyMod = 'alt' | 'ctrl' | 'super'
 
@@ -71,18 +73,27 @@ export type VoiceRecordKeyNamed = 'backspace' | 'delete' | 'enter' | 'escape' | 
 
 export interface ParsedVoiceRecordKey {
   /** Single character (``'b'``, ``'o'``) when ``named`` is undefined,
-   * otherwise the named-key token (``'space'``, ``'enter'``…). Kept as
-   * one field for back-compat with the v1 ``{ ch, mod, raw }`` shape. */
+   * otherwise the named-key token (``'enter'``, ``'tab'``…). Space is
+   * the exception: its printable char is just ``' '`` and the match
+   * layer (and runtime ``KeyEvent``) keys off ``ch === ' '`` — there is
+   * no ``key.space`` flag — so the parser emits ``' '`` for space.
+   * Kept as one field for back-compat with the v1 ``{ ch, mod, raw }``
+   * shape. */
   ch: string
   mod: VoiceRecordKeyMod
   named?: VoiceRecordKeyNamed
   raw: string
 }
 
+// Ctrl+Space is the default (not Ctrl+B): Ctrl+B is readline's backward-char
+// cursor key and must stay free for the composer. Ctrl+Space is a named key
+// supported by both the TUI parser and prompt_toolkit (c-space), and is the
+// conventional push-to-talk chord.
 export const DEFAULT_VOICE_RECORD_KEY: ParsedVoiceRecordKey = {
-  ch: 'b',
+  ch: ' ',
   mod: 'ctrl',
-  raw: 'ctrl+b'
+  named: 'space',
+  raw: 'ctrl+space'
 }
 
 /** Modifier aliases.
@@ -98,7 +109,7 @@ export const DEFAULT_VOICE_RECORD_KEY: ParsedVoiceRecordKey = {
  * terminals (iTerm2 CSI-u, Ghostty, Kitty, WezTerm, Alacritty) spell
  * the platform action modifier ``super`` / ``win``, which match the
  * unambiguous ``key.super`` bit. macOS users on Terminal.app stick
- * with the documented ``ctrl+b``.
+ * with the documented ``ctrl+space``.
  *
  * Cross-runtime parity: the ``ctrl`` / ``control`` / ``alt`` / ``option`` /
  * ``opt`` spellings are normalized identically in the classic CLI
@@ -143,14 +154,20 @@ const _NAMED_KEY_ALIASES: Record<string, VoiceRecordKeyNamed> = {
  * voice check runs, so a binding like ``ctrl+c`` (interrupt),
  * ``ctrl+d`` (quit), or ``ctrl+l`` (clear screen) would be advertised
  * in /voice status but never fire push-to-talk. Reject at parse time
- * so the user gets the documented Ctrl+B instead of a dead shortcut
+ * so the user gets the documented Ctrl+Space instead of a dead shortcut
  * (Copilot round-4 review on #19835).
+ *
+ * ``ctrl+b`` / ``ctrl+f`` are also reserved: they are readline's backward-
+ * char / forward-char cursor keys and the composer claims them for cursor
+ * movement, so a voice binding on either would be advertised in /voice
+ * status but never fire push-to-talk (the same blocklist rationale as
+ * above).
  *
  * ``ctrl+x`` is intentionally NOT here — it's only claimed during
  * queue-edit (``queueEditIdx !== null``), so the voice binding works
  * for most of the session and matches CLI parity for ``ctrl+<letter>``
  * bindings (Copilot round-8 review on #19835). */
-const _RESERVED_CTRL_CHARS = new Set(['c', 'd', 'l'])
+const _RESERVED_CTRL_CHARS = new Set(['c', 'd', 'l', 'b', 'f'])
 
 /** On macOS the action-modifier intercepts these editor chords via
  * ``isCopyShortcut`` / ``isAction`` in ``useInputHandlers()``:
@@ -212,7 +229,7 @@ const _matchesNamedKey = (named: VoiceRecordKeyNamed, key: RuntimeKeyEvent, ch: 
 }
 
 /**
- * Parse a config-string voice record key like ``ctrl+b`` / ``alt+r`` /
+ * Parse a config-string voice record key like ``alt+r`` / ``ctrl+o`` /
  * ``ctrl+space`` into ``{mod, ch, named?}``. Accepts single characters
  * AND the named tokens declared in ``_NAMED_KEY_ALIASES`` (``space``,
  * ``enter``/``return``, ``tab``, ``escape``/``esc``, ``backspace``,
@@ -223,7 +240,7 @@ const _matchesNamedKey = (named: VoiceRecordKeyNamed, key: RuntimeKeyEvent, ch: 
  * ``config.get full`` — a hand-edited ``voice.record_key: 1`` or
  * ``voice.record_key: true`` would otherwise crash ``.trim()`` on a
  * non-string scalar (Copilot round-3 review on #19835). Non-string /
- * empty / unrecognised values fall back to the documented Ctrl+B
+ * empty / unrecognised values fall back to the documented Ctrl+Space
  * default so a typo never silently disables the shortcut.
  */
 export const parseVoiceRecordKey = (raw: unknown): ParsedVoiceRecordKey => {
@@ -312,7 +329,12 @@ export const parseVoiceRecordKey = (raw: unknown): ParsedVoiceRecordKey => {
   const named = _NAMED_KEY_ALIASES[last]
 
   if (named) {
-    return { ch: named, mod, named, raw: lower }
+    // Space is the one named key whose printable char is just ' ' — the
+    // match layer keys off ``ch === ' '`` (not a ``key.space`` flag), and
+    // the default binding carries ``ch: ' '`` too, so the parser must
+    // emit the char, not the token. Other named keys keep the token as
+    // ``ch`` per the ParsedVoiceRecordKey contract.
+    return { ch: named === 'space' ? ' ' : named, mod, named, raw: lower }
   }
 
   // Unknown multi-character token (e.g. typo'd ``ctrl+spcae``) — fall back
@@ -337,11 +359,11 @@ export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
   return `${modLabel}+${keyLabel}`
 }
 
-/** Whether the parsed binding is the documented default (ctrl+b).
+/** Whether the parsed binding is the documented default (ctrl+space).
  *
  * Compare on the parsed spec rather than ``raw`` so semantically-equal
- * aliases (``control+b``, ``ctrl + b``) still get the macOS Cmd+B
- * muscle-memory fallback (Copilot review, round 2 on #19835). */
+ * aliases (``control+space``, ``ctrl + space``) still get the macOS
+ * Cmd+Space muscle-memory fallback (Copilot review, round 2 on #19835). */
 const _isDefaultVoiceKey = (parsed: ParsedVoiceRecordKey): boolean =>
   parsed.mod === DEFAULT_VOICE_RECORD_KEY.mod &&
   parsed.ch === DEFAULT_VOICE_RECORD_KEY.ch &&
@@ -391,11 +413,12 @@ export const isVoiceToggleKey = (
       // Ctrl+Alt+<key> / Ctrl+Cmd+<key> doesn't spuriously match
       // ``ctrl+<key>`` (Copilot round-6 review on #19835).
       //
-      // The documented default (``ctrl+b``) additionally accepts the
-      // explicit ``key.super`` bit on macOS for Cmd+B muscle memory —
+      // The documented default (``ctrl+space``) additionally accepts the
+      // explicit ``key.super`` bit on macOS for Cmd+Space muscle memory —
       // but ONLY ``key.super`` (kitty-style), never ``key.meta``, since
-      // ``key.meta`` is hermes-ink's Alt signal and accepting it would
-      // fire the binding on Alt+B.
+      // ``key.meta`` is hermes-ink's Alt signal. (In practice macOS often
+      // intercepts Cmd+Space for Spotlight before the terminal sees it, so
+      // the Ctrl+Space path is the reliable one.)
       if (key.ctrl) {
         return !key.alt && !key.meta && key.super !== true
       }

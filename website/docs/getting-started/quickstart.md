@@ -288,7 +288,7 @@ uv pip install --python ./venv/bin/python -e ".[voice]"
 # Includes faster-whisper for free local speech-to-text
 ```
 
-Then in the CLI: `/voice on`. Press `Ctrl+B` to record. See [Voice Mode](../user-guide/features/voice-mode.md).
+Then in the CLI: `/voice on`. Press `Ctrl+Space` to record. See [Voice Mode](../user-guide/features/voice-mode.md).
 
 ### Skills
 

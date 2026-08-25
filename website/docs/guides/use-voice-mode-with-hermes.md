@@ -165,7 +165,7 @@ If you skip that install or it fails, the wizard falls back to Edge TTS.
 
 ```yaml
 voice:
-  record_key: "ctrl+b"
+  record_key: "ctrl+space"
   max_recording_seconds: 120
   auto_tts: false
   beep_enabled: true
@@ -216,10 +216,10 @@ Inside the CLI:
 ### Recording flow
 
 Default key:
-- `Ctrl+B`
+- `Ctrl+Space`
 
 Workflow:
-1. press `Ctrl+B`
+1. press `Ctrl+Space`
 2. speak
 3. wait for silence detection to stop recording automatically
 4. Hermes transcribes and responds
@@ -286,12 +286,15 @@ voice:
 
 ### Record key
 
-If `Ctrl+B` conflicts with your terminal or tmux habits:
+If `Ctrl+Space` conflicts with your terminal, tmux, or OS habits (for
+example macOS Spotlight also binds Cmd/Ctrl+Space):
 
 ```yaml
 voice:
-  record_key: "ctrl+space"
+  record_key: "alt+space"
 ```
+
+Any `ctrl+<key>` / `alt+<key>` chord works; see the TUI/CLI key tables.
 
 ## Use case 2: voice replies in Telegram or Discord
 

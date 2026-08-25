@@ -1934,7 +1934,7 @@ STT_OPENAI_BASE_URL=https://api.openai.com/v1
 
 ```yaml
 voice:
-  record_key: "ctrl+b"         # Push-to-talk key inside the CLI
+  record_key: "ctrl+space"      # Push-to-talk key inside the CLI
   max_recording_seconds: 120    # Hard stop for long recordings
   auto_tts: false               # Enable spoken replies automatically when /voice on
   beep_enabled: true            # Play record start/stop beeps in CLI voice mode
