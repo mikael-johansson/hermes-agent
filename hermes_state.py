@@ -3119,6 +3119,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
+                    if self._conn is None:
+                        # Matches the read-path guard (see get_session_counts_by_source).
+                        # Without this, a write against a closed store surfaced as
+                        # "'NoneType' object has no attribute 'execute'", which callers
+                        # log verbatim — 248 such lines across 6 webui sessions before
+                        # this guard, with no indication the store was the problem.
+                        raise RuntimeError("SessionDB connection is closed")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -3379,6 +3386,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+
+    @property
+    def is_closed(self) -> bool:
+        """True once :meth:`close` has run (or the connection never opened).
+
+        Lets callers skip expensive work they could not commit anyway, instead
+        of discovering it at ``_execute_write`` time. Cheap and lock-free: the
+        attribute is only ever set to a connection or to None.
+        """
+        return self._conn is None
 
     def close(self):
         """Close the database connection.

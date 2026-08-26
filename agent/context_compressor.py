@@ -3468,6 +3468,15 @@ class ContextCompressor(ContextEngine):
             and not callable(getattr(session_db, "archive_and_compact", None))
         ):
             return messages, 0
+        # Same reasoning one step further: a store whose connection has been
+        # closed cannot commit either, so the 3-pass scan below is pure waste.
+        # Observed in webui sessions, where the compressor outlives the
+        # SessionDB handle it captured: 248 "prune DB commit failed ...
+        # 'NoneType' object has no attribute 'execute'" warnings across 6
+        # sessions, each one paid for after a full scan. getattr-guarded so
+        # duck-typed/plugin stores without the property are unaffected.
+        if session_db is not None and getattr(session_db, "is_closed", False):
+            return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
