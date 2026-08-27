@@ -382,6 +382,66 @@ export function ctrlDEffect(
 }
 
 /**
+ * Readline `transpose-chars` (Ctrl+T): swap the two grapheme clusters
+ * immediately before the cursor, then move the cursor one cluster to the
+ * right (clamped at EOL). With the cursor at the end of the line — the
+ * common "I mistyped" case — that is "swap the last two characters", so
+ * `...xy` becomes `...yx` and the cursor stays at the end; mid-line it
+ * swaps the pair left of the cursor and lands the cursor past them.
+ *
+ * Pure and testable, like `ctrlDEffect`:
+ *   - two or more grapheme clusters before the cursor -> swap + advance
+ *   - cursor at the start / only one cluster before it -> no-op
+ *
+ * Working in grapheme clusters (via `graphemeStops`, the same primitive
+ * `prevPos`/`nextPos` use) keeps emoji and combining sequences intact.
+ * The result is applied by the caller with `commit(newValue, newCursor)`.
+ */
+export function transposeEffect(value: string, cursor: number): { cursor: number; value: string } {
+  if (value.length < 2) {
+    return { cursor, value }
+  }
+
+  const pos = snapPos(value, cursor)
+  const stops = graphemeStops(value)
+
+  // prev  = the boundary just before the cursor (start of the cluster
+  //         adjacent to the cursor, call it c1)
+  // prev2 = the boundary before that (start of the cluster before it, c0)
+  // next  = the first boundary strictly after the cursor, where the cursor
+  //         lands after the swap (-1 at EOL -> stays put)
+  let prev = -1
+  let prev2 = -1
+  let next = -1
+
+  for (const s of stops) {
+    if (s < pos) {
+      prev2 = prev
+      prev = s
+    } else if (s > pos && next < 0) {
+      next = s
+    }
+  }
+
+  if (prev < 0 || prev2 < 0) {
+    // Fewer than two clusters before the cursor — nothing to transpose.
+    return { cursor, value }
+  }
+
+  if (next < 0) {
+    next = pos
+  }
+
+  const a = value.slice(prev2, prev)
+  const b = value.slice(prev, pos)
+
+  return {
+    cursor: next,
+    value: value.slice(0, prev2) + b + a + value.slice(pos)
+  }
+}
+
+/**
  * Readline `kill-line` (Ctrl+K / Cmd+ForwardDelete): kill forward to the
  * end of the current logical line. At a line end, consume the newline so a
  * repeat press joins the next line rather than doing nothing.
@@ -1192,6 +1252,26 @@ export function TextInput({
         if (effect.newValue !== vRef.current || effect.newCursor !== curRef.current) {
           event.stopImmediatePropagation()
           commit(effect.newValue, effect.newCursor)
+        }
+
+        return
+      }
+
+      // Ctrl+T is readline's transpose-chars: swap the two characters before
+      // the cursor (at EOL, the last two) and move the cursor past the pair.
+      // Claimed at the composer level because the global handler would
+      // otherwise type a literal "t". A selection kills first (Ctrl-D/Ctrl-X),
+      // so transposing while one is active is a no-op.
+      if (k.ctrl && !k.meta && !k.super && inp.toLowerCase() === 't') {
+        flushKeyBurst()
+
+        if (!selRange()) {
+          const effect = transposeEffect(vRef.current, curRef.current)
+
+          if (effect.value !== vRef.current || effect.cursor !== curRef.current) {
+            event.stopImmediatePropagation()
+            commit(effect.value, effect.cursor)
+          }
         }
 
         return
