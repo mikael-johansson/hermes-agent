@@ -382,20 +382,18 @@ export function ctrlDEffect(
 }
 
 /**
- * Readline `transpose-chars` (Ctrl+T): swap the two grapheme clusters
- * immediately before the cursor, then move the cursor one cluster to the
- * right (clamped at EOL). With the cursor at the end of the line — the
- * common "I mistyped" case — that is "swap the last two characters", so
- * `...xy` becomes `...yx` and the cursor stays at the end; mid-line it
- * swaps the pair left of the cursor and lands the cursor past them.
+ * Readline `transpose-chars` (Ctrl+T): swap two adjacent grapheme
+ * clusters, depending on where the cursor sits:
+ *   - at the end of the line (the common "I mistyped" case): swap the
+ *     last two characters — `...xy` becomes `...yx` — cursor stays at EOL
+ *   - mid-line: swap the cluster under the cursor with the one just
+ *     before it, then advance the cursor one cluster
+ *   - at the start of the line / fewer than two clusters: no-op
  *
- * Pure and testable, like `ctrlDEffect`:
- *   - two or more grapheme clusters before the cursor -> swap + advance
- *   - cursor at the start / only one cluster before it -> no-op
- *
- * Working in grapheme clusters (via `graphemeStops`, the same primitive
- * `prevPos`/`nextPos` use) keeps emoji and combining sequences intact.
- * The result is applied by the caller with `commit(newValue, newCursor)`.
+ * Pure and testable, like `ctrlDEffect`. Working in grapheme clusters
+ * (via `graphemeStops`, the same primitive `prevPos`/`nextPos` use)
+ * keeps emoji and combining sequences intact. The result is applied by
+ * the caller with `commit(newValue, newCursor)`.
  */
 export function transposeEffect(value: string, cursor: number): { cursor: number; value: string } {
   if (value.length < 2) {
@@ -404,40 +402,45 @@ export function transposeEffect(value: string, cursor: number): { cursor: number
 
   const pos = snapPos(value, cursor)
   const stops = graphemeStops(value)
+  const n = stops.length - 1 // number of grapheme clusters
 
-  // prev  = the boundary just before the cursor (start of the cluster
-  //         adjacent to the cursor, call it c1)
-  // prev2 = the boundary before that (start of the cluster before it, c0)
-  // next  = the first boundary strictly after the cursor, where the cursor
-  //         lands after the swap (-1 at EOL -> stays put)
-  let prev = -1
-  let prev2 = -1
-  let next = -1
-
-  for (const s of stops) {
-    if (s < pos) {
-      prev2 = prev
-      prev = s
-    } else if (s > pos && next < 0) {
-      next = s
-    }
-  }
-
-  if (prev < 0 || prev2 < 0) {
-    // Fewer than two clusters before the cursor — nothing to transpose.
+  if (n < 2 || pos === 0) {
+    // Cursor at the start (or fewer than two clusters) — nothing to transpose.
     return { cursor, value }
   }
 
-  if (next < 0) {
-    next = pos
+  // k = index of the stop the (snapped) cursor sits on: stops[k] === pos.
+  let k = 0
+
+  for (let i = 1; i < stops.length; i++) {
+    if (stops[i] <= pos) {
+      k = i
+    } else {
+      break
+    }
   }
 
-  const a = value.slice(prev2, prev)
-  const b = value.slice(prev, pos)
+  // Boundaries [a, b, c) of the two adjacent clusters being swapped.
+  let a = 0
+  let b = 0
+  let c = 0
+
+  if (k === n) {
+    // EOL: the last two clusters; the cursor stays where it is.
+    a = stops[n - 2]
+    b = stops[n - 1]
+    c = stops[n]
+  } else {
+    // Mid-line: the cluster under the cursor and the one before it;
+    // the cursor lands past the moved cluster.
+    a = stops[k - 1]
+    b = stops[k]
+    c = stops[k + 1]
+  }
 
   return {
-    cursor: next,
-    value: value.slice(0, prev2) + b + a + value.slice(pos)
+    cursor: c,
+    value: value.slice(0, a) + value.slice(b, c) + value.slice(a, b) + value.slice(c)
   }
 }
 
