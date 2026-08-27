@@ -339,6 +339,49 @@ export function killToLineStart(value: string, cursor: number): { value: string;
 }
 
 /**
+ * Readline `kill-char` (Ctrl+D): the classic "delete forward one character"
+ * action, plus its shell meaning — on an *empty* line it is EOF (exit /
+ * dashboard new-session, handled by the global input handler).
+ *
+ * Pure so the decision table is unit-testable without a mounted composer
+ * (same shape as `killToLineStart` / `killToLineEnd`):
+ *
+ * - selection active  -> delete the whole selection, cursor to its start
+ * - cursor < EOL      -> delete the next grapheme cluster (`nextPos` keeps
+ *                        multi-byte / combining-sequence input correct)
+ * - cursor at EOL     -> `exit`: caller decides between "idle exit" (global
+ *                        handler) and "do nothing"; the composer only emits
+ *                        `exit` when the value is empty, a non-empty value
+ *                        with the cursor at EOL is a no-op
+ *
+ * The result is applied by the caller with `commit(newValue, newCursor)`.
+ * Deleting via `nextPos` (not a raw `slice(cursor+1)`) keeps multi-byte
+ * characters and combining sequences intact, same as the forward-delete key.
+ */
+export function ctrlDEffect(
+  value: string,
+  cursor: number,
+  selection?: { end: number; start: number } | null
+): { exit: boolean; newCursor: number; newValue: string } {
+  if (selection && selection.start !== selection.end) {
+    return {
+      exit: false,
+      newCursor: selection.start,
+      newValue: value.slice(0, selection.start) + value.slice(selection.end)
+    }
+  }
+
+  if (cursor < value.length) {
+    const to = nextPos(value, cursor)
+
+    return { exit: false, newCursor: cursor, newValue: value.slice(0, cursor) + value.slice(to) }
+  }
+
+  // cursor at end of line: kill-char has nothing to delete.
+  return { exit: value.length === 0, newCursor: cursor, newValue: value }
+}
+
+/**
  * Readline `kill-line` (Ctrl+K / Cmd+ForwardDelete): kill forward to the
  * end of the current logical line. At a line end, consume the newline so a
  * repeat press joins the next line rather than doing nothing.
@@ -1123,6 +1166,33 @@ export function TextInput({
         flushKeyBurst()
         const pos = inp.toLowerCase() === 'b' ? prevPos(vRef.current, curRef.current) : nextPos(vRef.current, curRef.current)
         moveCursor(pos, k.shift)
+
+        return
+      }
+
+      // Ctrl+D is readline's kill-char: delete the next character (or the
+      // selected region) at the cursor. Only when the line is ALREADY empty
+      // do we let it fall through to the global handler, which performs the
+      // traditional idle exit / dashboard new-session (the shell-EOF
+      // behaviour) — so a typed draft can never kill the session.
+      // stopImmediatePropagation() keeps the global Ctrl-D exit out of the
+      // listener loop; the composer listener registers before the global
+      // one (stable emitter slot), so the shield is guaranteed.
+      if (k.ctrl && !k.meta && !k.super && inp.toLowerCase() === 'd') {
+        flushKeyBurst()
+
+        const effect = ctrlDEffect(vRef.current, curRef.current, selRange())
+
+        if (effect.exit) {
+          // empty line -> EOF: defer to the global handler (idle exit /
+          // dashboard new-session).
+          return
+        }
+
+        if (effect.newValue !== vRef.current || effect.newCursor !== curRef.current) {
+          event.stopImmediatePropagation()
+          commit(effect.newValue, effect.newCursor)
+        }
 
         return
       }

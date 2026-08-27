@@ -619,6 +619,15 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (isAction(key, ch, 'd')) {
+      // Ctrl-C-style guard (2026-08-26 design, see keybindings reference
+      // ctrl-d-kill-char): with a draft in the composer, Ctrl-D is readline
+      // kill-char and the composer handles it itself (it also stops
+      // immediate propagation, so this is a belt-and-braces net for the
+      // unfocused / composer-not-active case). Never idle-exit on a draft.
+      if (cState.input || cState.inputBuf.length) {
+        return
+      }
+
       return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
         gateway.gw.publishLocalEvent({
           payload: { reason: 'idle_exit_hotkey' },

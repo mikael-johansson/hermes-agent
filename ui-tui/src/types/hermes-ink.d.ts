@@ -29,6 +29,12 @@ declare module '@hermes/ink' {
     readonly input: string
     readonly key: Key
     readonly keypress: { readonly isPasted?: boolean; readonly raw?: string }
+    // Mirrors the runtime `InputEvent extends Event` (hermes-ink events/
+    // input-event.ts): the emitter's `emit()` honors
+    // `stopImmediatePropagation()` so an earlier-registered useInput listener
+    // (the composer) can shield later ones (e.g. the global Ctrl-D idle-exit
+    // handler) from seeing the same keystroke.
+    readonly stopImmediatePropagation: () => void
   }
 
   export type InputHandler = (input: string, key: Key, event: InputEvent) => void
