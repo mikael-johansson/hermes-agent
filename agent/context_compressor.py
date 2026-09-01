@@ -1181,7 +1181,15 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                # Marker wording matters. The old "...[truncated]" read to the
+                # model as "the tool call you just made was truncated", and
+                # agents repeatedly mis-diagnosed it as a broken write pipeline
+                # — burning whole sessions bisecting a phantom size limit after
+                # seeing their own earlier write_file/skill_manage content end
+                # this way. Only the STORED TRANSCRIPT COPY is shortened; the
+                # call itself was dispatched in full and the file on disk is
+                # complete. Say so in the marker.
+                return obj[:head_chars] + "...[elided from history]"
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
