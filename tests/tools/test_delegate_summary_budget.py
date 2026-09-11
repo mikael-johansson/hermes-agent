@@ -76,3 +76,28 @@ def test_empty_results_is_noop():
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
     )
+
+
+def test_effective_summary_cap_matches_static_ceiling_with_no_parent():
+    # No parent handle (e.g. computed well after dispatch) → dynamic half is
+    # unavailable, static ceiling still applies.
+    assert dt._effective_summary_cap(None, 1) == dt.DEFAULT_MAX_SUMMARY_CHARS
+
+
+def test_effective_summary_cap_takes_the_tighter_of_the_two():
+    # Parent nearly full → dynamic budget floors to _MIN_SUMMARY_CHARS, which
+    # is well below the static ceiling.
+    parent = _FakeParent(context_length=131_000, used_tokens=131_000, max_tokens=8_000)
+    assert dt._effective_summary_cap(parent, 1) == dt._MIN_SUMMARY_CHARS
+
+
+def test_child_prompt_states_the_concrete_budget_when_known():
+    prompt = dt._build_child_system_prompt("do the thing", summary_char_budget=5_000)
+    assert "5,000 characters" in prompt
+    assert "write them to a file" in prompt
+
+
+def test_child_prompt_falls_back_to_generic_guidance_when_cap_unknown():
+    prompt = dt._build_child_system_prompt("do the thing", summary_char_budget=None)
+    assert "Keep your final summary tight" in prompt
+    assert "characters" not in prompt

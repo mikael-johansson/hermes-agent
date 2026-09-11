@@ -820,6 +820,39 @@ def dispatch_async_delegation(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
+def _cap_result_summary(result: Dict[str, Any]) -> None:
+    """Belt-and-suspenders: cap a single completion's summary before it's
+    rendered into a parent's history.
+
+    The delegate_task batch path already caps summaries (against the live
+    parent's headroom) inside _execute_and_aggregate before the result ever
+    reaches this module. This second pass is for callers that dispatch
+    through this module directly (e.g. cronjob_tools' manual-run reporting)
+    and have no live parent_agent handle here — only the static
+    ``delegation.max_summary_chars`` ceiling applies in that case, but that's
+    still strictly better than the unbounded default. Idempotent: a summary
+    already under the cap is left untouched.
+    """
+    try:
+        from tools.delegate_tool import _apply_summary_budget
+
+        _apply_summary_budget([result], None)
+    except Exception:
+        logger.debug("Summary cap pass failed for single completion", exc_info=True)
+
+
+def _cap_batch_summaries(combined: Dict[str, Any]) -> None:
+    """Same belt-and-suspenders pass as _cap_result_summary, for a batch."""
+    try:
+        from tools.delegate_tool import _apply_summary_budget
+
+        results = combined.get("results")
+        if isinstance(results, list):
+            _apply_summary_budget(results, None)
+    except Exception:
+        logger.debug("Summary cap pass failed for batch completion", exc_info=True)
+
+
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
     claimed = _begin_finalization(delegation_id)
@@ -827,6 +860,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    _cap_result_summary(result)
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -1070,6 +1104,7 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
+    _cap_batch_summaries(combined)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 

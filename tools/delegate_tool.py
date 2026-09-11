@@ -905,6 +905,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    summary_char_budget: Optional[int] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -935,12 +936,31 @@ def _build_child_system_prompt(
         "- Any files you created or modified\n"
         "- Any issues encountered\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
-        "Keep your final summary tight: lead with outcomes, prefer bullet "
-        "points over paragraphs, and don't replay your whole process. Your "
-        "response is returned to the parent agent as a summary, and overlong "
-        "summaries crowd out the parent's context window."
+        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands."
     )
+    if summary_char_budget:
+        parts.append(
+            "\n"
+            f"Your final summary is returned to the parent VERBATIM and is hard-capped at "
+            f"~{summary_char_budget:,} characters — anything over that gets cut off with a "
+            "mid-text truncation marker, which is much worse than a summary you shaped "
+            "yourself. Budget for this as you write, not after:\n"
+            "- Lead with outcomes and next steps; skip narrating your process.\n"
+            "- Prefer bullet points over paragraphs.\n"
+            "- If your findings are long (research notes, file contents, a big diff), write "
+            "them to a file in the workspace and point to it (path + how to read it) instead "
+            "of pasting the content — the parent can read the file on demand.\n"
+            "- If you're about to exceed the budget, stop and compress rather than letting it "
+            "run long; a shorter summary you controlled beats a longer one truncated for you."
+        )
+    else:
+        parts.append(
+            "\n"
+            "Keep your final summary tight: lead with outcomes, prefer bullet "
+            "points over paragraphs, and don't replay your whole process. Your "
+            "response is returned to the parent agent as a summary, and overlong "
+            "summaries crowd out the parent's context window."
+        )
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -1427,6 +1447,10 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # Tell the child its summary budget up front (computed the same way the
+    # post-hoc trim in _apply_summary_budget is) so it can shape a summary
+    # that fits, rather than have one cut off after the fact.
+    summary_cap = _effective_summary_cap(parent_agent, task_count)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1434,6 +1458,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        summary_char_budget=summary_cap,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -2018,13 +2043,35 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         return None
 
 
+def _effective_summary_cap(parent_agent, n_summaries: int) -> Optional[int]:
+    """Per-summary character cap for a batch of ``n_summaries`` subagents.
+
+    The MIN of:
+      - the dynamic headroom budget (remaining parent context ÷ batch size), and
+      - the static ``delegation.max_summary_chars`` ceiling (0 = disabled).
+
+    Returns None when both are absent/disabled — caller should leave summaries
+    untouched. ``parent_agent`` may be None (e.g. computing this well after the
+    dispatching turn ended, or from a caller with no live parent handle) — the
+    dynamic half is simply unavailable then and the static ceiling still holds.
+    """
+    cfg = _load_config()
+    try:
+        static_ceiling = int(cfg.get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
+    except (TypeError, ValueError):
+        static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
+
+    dynamic_budget = _parent_summary_char_budget(parent_agent, n_summaries)
+
+    candidates = [c for c in (static_ceiling, dynamic_budget) if c and c > 0]
+    if not candidates:
+        return None
+    return min(candidates)
+
+
 def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
     """Trim subagent summaries in-place so the batch can't overflow the
     parent's context window, spilling full text to disk so nothing is lost.
-
-    The effective per-summary cap is the MIN of:
-      - the dynamic headroom budget (remaining parent context ÷ batch size), and
-      - the static ``delegation.max_summary_chars`` ceiling (0 = disabled).
 
     When a summary exceeds the cap, its full text is written to a file and the
     in-context summary becomes a head slice plus a pointer to that file. This
@@ -2038,19 +2085,9 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
     if not summaries:
         return
 
-    cfg = _load_config()
-    try:
-        static_ceiling = int(cfg.get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
-    except (TypeError, ValueError):
-        static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
-
-    dynamic_budget = _parent_summary_char_budget(parent_agent, len(summaries))
-
-    # Combine the two caps. Either can be absent/disabled.
-    candidates = [c for c in (static_ceiling, dynamic_budget) if c and c > 0]
-    if not candidates:
+    cap = _effective_summary_cap(parent_agent, len(summaries))
+    if cap is None:
         return  # both disabled / unknown → leave summaries untouched
-    cap = min(candidates)
 
     for entry in summaries:
         summary = entry["summary"]
