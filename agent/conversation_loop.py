@@ -74,6 +74,7 @@ from agent.model_metadata import (
     is_output_cap_error,
     parse_available_output_tokens_from_error,
     prompt_fits_window,
+    reports_derived_overflow_bound,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -1580,6 +1581,12 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # Output-cap retries already applied for this turn.  Used to stop believing
+    # a provider-reported input size that is really a window-derived lower
+    # bound (see reports_derived_overflow_bound): the first such rejection gets
+    # the cheap max_tokens retry, a repeat is treated as the input overflow it
+    # actually is.
+    output_cap_retries = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
     # overflow/413 retry handlers, and the post-tool compaction gate.
@@ -5160,7 +5167,25 @@ def run_conversation(
                     # Note: max_tokens = output token cap (one response).
                     #       context_length = total window (input + output combined).
                     available_out = parse_available_output_tokens_from_error(error_msg)
+                    # A provider that derives the quoted input size from the
+                    # window (input = ctx + 1 - max_tokens) makes every input
+                    # overflow look like an output-cap error whose fix is to
+                    # shave a few tokens off max_tokens.  The first retry is
+                    # still worth taking — a prompt that genuinely is
+                    # ctx + 1 - max_tokens is fixed by exactly that.  A repeat
+                    # proves the figure was not a measurement, so stop nibbling
+                    # the output cap and handle the real input overflow.
+                    if available_out is not None and reports_derived_overflow_bound(error_msg):
+                        if output_cap_retries >= 1:
+                            logger.warning(
+                                "%sProvider reported a window-derived input bound twice "
+                                "(input+max_tokens == context_length+1); treating as input "
+                                "overflow instead of an output-cap error.",
+                                agent.log_prefix,
+                            )
+                            available_out = None
                     if available_out is not None:
+                        output_cap_retries += 1
                         # This is an output-cap error, not input overflow.
                         # The provider's available_tokens is the authoritative
                         # cap for the failed request, so keep it as an upper

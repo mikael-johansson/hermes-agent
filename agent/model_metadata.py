@@ -1689,6 +1689,39 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     return None
 
 
+def reports_derived_overflow_bound(error_msg: str) -> bool:
+    """True when the quoted input size is a LOWER BOUND derived from the window.
+
+    Some vLLM builds never measure the prompt for this rejection.  They
+    synthesise the figure from the window itself — ``input = ctx + 1 -
+    max_tokens`` — so the quoted total always lands on exactly ``ctx + 1`` no
+    matter how far over the request really is.  Observed live against a 140000
+    window, where every rejection in one session summed to exactly 140001:
+    ``16384+123617``, ``16319+123682`` … ``10520+129481``.
+
+    Such a figure says nothing about the real prompt size.  Believing it makes
+    :func:`parse_available_output_tokens_from_error` collapse to ``max_tokens -
+    1``, so an INPUT overflow looks like a trivially-fixable output-cap error:
+    the caller shaves a few tokens off the output cap, gets the identical
+    rejection, and repeats until its attempt budget is gone.
+
+    This cannot be decided from one message — a prompt that genuinely is
+    ``ctx + 1 - max_tokens`` produces the same arithmetic, and there the
+    output-cap retry is the correct, cheap fix.  So this is a *tiebreaker for a
+    repeat*: callers should try the output-cap retry once, and only treat the
+    bound as fabricated when the same rejection comes back again.
+    """
+    error_lower = error_msg.lower()
+    _m_ctx = re.search(r'maximum context length is (\d+)\s*token', error_lower)
+    _m_input = re.search(
+        r'prompt contains (?:at least )?(\d+)\s*input tokens', error_lower
+    )
+    _m_requested = re.search(r'requested (\d+)\s*output tokens', error_lower)
+    if not (_m_ctx and _m_input and _m_requested):
+        return False
+    return int(_m_input.group(1)) + int(_m_requested.group(1)) == int(_m_ctx.group(1)) + 1
+
+
 def is_output_cap_error(error_msg: str) -> bool:
     """Return True if a 400 is about the OUTPUT cap (max_tokens) being too large.
 

@@ -2,6 +2,7 @@ import pytest
 from agent.model_metadata import (
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    reports_derived_overflow_bound,
 )
 
 
@@ -132,3 +133,56 @@ class TestParseVllmTokenBasedOutputCap:
         assert available is not None
         assert available + 65537 <= 131072
 
+
+
+class TestDerivedOverflowBound:
+    """Some vLLM builds never measure the prompt for this rejection.
+
+    They synthesise the quoted input size from the window itself
+    (``input = ctx + 1 - max_tokens``), so the total always lands on exactly
+    ``ctx + 1`` however far over the request really is.  Believing that figure
+    turns an INPUT overflow into an apparent output-cap error whose "fix" is to
+    shave a few tokens off max_tokens — which never converges, and burns the
+    caller's attempt budget instead.  Observed live against a 140000 window:
+    every rejection in the session summed to exactly 140001.
+    """
+
+    @staticmethod
+    def _vllm(ctx: int, requested: int, reported_input: int) -> str:
+        return (
+            f"This model's maximum context length is {ctx} tokens. However, you "
+            f"requested {requested} output tokens and your prompt contains at "
+            f"least {reported_input} input tokens, for a total of at least "
+            f"{requested + reported_input} tokens. Please reduce the length of "
+            "the input prompt or the number of requested output tokens."
+        )
+
+    @pytest.mark.parametrize(
+        "requested,reported_input",
+        [(16384, 123617), (16319, 123682), (16059, 123942), (10520, 129481)],
+    )
+    def test_production_rejections_are_flagged_as_derived(self, requested, reported_input):
+        # Verbatim (requested, reported) pairs from three unrelated sessions —
+        # every one sums to the window plus one.
+        assert requested + reported_input == 140001
+        assert reports_derived_overflow_bound(self._vllm(140000, requested, reported_input))
+
+    def test_genuine_measurement_is_not_flagged(self):
+        msg = self._vllm(131072, 8192, 100000)
+        assert reports_derived_overflow_bound(msg) is False
+        assert parse_available_output_tokens_from_error(msg) == 31072
+
+    def test_first_retry_is_still_offered_for_a_derived_bound(self):
+        # The detector is a tiebreaker for a REPEAT, not a veto: a prompt that
+        # genuinely is ctx + 1 - max_tokens is fixed by exactly this retry, so
+        # the parser must keep returning a usable cap on the first rejection.
+        msg = self._vllm(140000, 16384, 123617)
+        assert parse_available_output_tokens_from_error(msg) == 16383
+
+    def test_non_vllm_phrasings_are_not_flagged(self):
+        assert reports_derived_overflow_bound(
+            "max_tokens: 32768 > context_window: 200000 - input_tokens: 190000 "
+            "= available_tokens: 10000"
+        ) is False
+        assert reports_derived_overflow_bound("Range of max_tokens should be [1, 65536]") is False
+        assert reports_derived_overflow_bound("") is False
