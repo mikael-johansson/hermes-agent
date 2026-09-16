@@ -1389,3 +1389,70 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+class TestReasoningExcludedFromWireEstimate:
+    """Thinking traces are persisted but only sent on the echo-back families.
+
+    ``apply_reasoning_content_policy`` pops ``reasoning_content`` for every
+    endpoint outside DeepSeek/Kimi/MiMo, so counting it estimates content the
+    provider never receives.  Session 87f5d6c1720c held 109,731 chars of
+    message content against 1,428,663 chars of reasoning (the same trace in
+    both ``reasoning`` and ``reasoning_content``, so counted twice): its real
+    prompt was 84,611 tokens but the estimate read 400,298, and the turn died
+    on "Context length exceeded ... Cannot compress further" against a 140,000
+    window while compaction had been working correctly the whole time.
+    """
+
+    @staticmethod
+    def _msg(reasoning_chars: int) -> dict:
+        return {
+            "role": "assistant",
+            "content": "short answer",
+            "reasoning": "T" * reasoning_chars,
+            "reasoning_content": "T" * reasoning_chars,
+        }
+
+    def test_reasoning_is_excluded_by_default(self):
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        lean = estimate_messages_tokens_rough([{"role": "assistant", "content": "short answer"}])
+        heavy = estimate_messages_tokens_rough([self._msg(400_000)])
+        # 800K chars of thinking must not move an estimate of what is sent.
+        assert heavy == lean
+
+    def test_reasoning_is_counted_when_the_endpoint_echoes_it(self):
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        heavy = estimate_messages_tokens_rough([self._msg(400_000)], count_reasoning=True)
+        # ~800K chars across both keys at ~4 chars/token.
+        assert heavy > 150_000
+
+    def test_memo_does_not_leak_across_the_two_modes(self):
+        # One process serves sessions on different providers; an echo-provider
+        # estimate must not read a non-echo entry out of the shared memo.
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        msgs = [self._msg(40_000)]
+        first = estimate_messages_tokens_rough(msgs)
+        second = estimate_messages_tokens_rough(msgs, count_reasoning=True)
+        assert second > first
+        assert estimate_messages_tokens_rough(msgs) == first
+
+    def test_request_estimate_threads_the_flag(self):
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        msgs = [self._msg(40_000)]
+        off = estimate_request_tokens_rough(msgs, system_prompt="sys")
+        on = estimate_request_tokens_rough(msgs, system_prompt="sys", count_reasoning=True)
+        assert on > off
+
+    def test_reasoning_details_stays_excluded(self):
+        # Pre-existing exclusion must not regress.
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        base = estimate_messages_tokens_rough([{"role": "assistant", "content": "hi"}])
+        with_details = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": "hi", "reasoning_details": "D" * 100_000}]
+        )
+        assert with_details == base

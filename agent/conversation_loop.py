@@ -5103,7 +5103,9 @@ def run_conversation(
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
                     # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
+                    new_tokens = estimate_messages_tokens_rough(
+                        messages, count_reasoning=agent._needs_thinking_reasoning_pad()
+                    )
                     approx_tokens = new_tokens  # update for downstream logging
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
@@ -5257,7 +5259,10 @@ def run_conversation(
                             conversation_history = conversation_history_after_compression(
                                 agent, messages, conversation_history
                             )
-                            new_tokens = estimate_messages_tokens_rough(messages)
+                            new_tokens = estimate_messages_tokens_rough(
+                                messages,
+                                count_reasoning=agent._needs_thinking_reasoning_pad(),
+                            )
                             if len(messages) < original_len:
                                 agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                             elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
@@ -5422,7 +5427,9 @@ def run_conversation(
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
                     # message array.  (#39550)
-                    new_tokens = estimate_messages_tokens_rough(messages)
+                    new_tokens = estimate_messages_tokens_rough(
+                        messages, count_reasoning=agent._needs_thinking_reasoning_pad()
+                    )
                     approx_tokens = new_tokens  # update for downstream logging
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):

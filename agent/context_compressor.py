@@ -1698,9 +1698,29 @@ class ContextCompressor(ContextEngine):
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             return
-        telemetry["protected_head_tokens"] = estimate_messages_tokens_rough(head_messages)
-        telemetry["middle_window_tokens"] = estimate_messages_tokens_rough(middle_messages)
-        telemetry["protected_tail_tokens"] = estimate_messages_tokens_rough(tail_messages)
+        # Thinking traces only reach the provider on the echo-back families, so
+        # only those may count toward a region's size.  Counting them elsewhere
+        # reported a protected tail of 396,784 tokens for a transcript whose
+        # real prompt was 84,611 (session 87f5d6c1720c).
+        _count_reasoning = self._counts_reasoning_on_the_wire()
+        telemetry["protected_head_tokens"] = estimate_messages_tokens_rough(
+            head_messages, count_reasoning=_count_reasoning
+        )
+        telemetry["middle_window_tokens"] = estimate_messages_tokens_rough(
+            middle_messages, count_reasoning=_count_reasoning
+        )
+        telemetry["protected_tail_tokens"] = estimate_messages_tokens_rough(
+            tail_messages, count_reasoning=_count_reasoning
+        )
+
+    def _counts_reasoning_on_the_wire(self) -> bool:
+        """True when this endpoint echoes reasoning back into the request."""
+        try:
+            from agent.message_sanitization import needs_reasoning_echo
+
+            return needs_reasoning_echo(self.provider, self.model, self.base_url)
+        except Exception:
+            return False
 
     def _record_aux_compression_call(
         self,

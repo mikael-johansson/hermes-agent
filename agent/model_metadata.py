@@ -3226,7 +3226,11 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], scale: float = 1.0) -> int:
+def estimate_messages_tokens_rough(
+    messages: List[Dict[str, Any]],
+    scale: float = 1.0,
+    count_reasoning: bool = False,
+) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
@@ -3247,7 +3251,7 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], scale: float 
     _IMAGE_TOKEN_COST = 1500
     total = 0
     for msg in messages:
-        total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST)
+        total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST, count_reasoning)
     return apply_token_estimate_scale(total, scale)
 
 
@@ -3299,21 +3303,23 @@ def _msg_fingerprint(value: Any, pins: list) -> Any:
     raise ValueError("unfingerprintable message value")
 
 
-def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
+def _estimate_message_tokens_cached(
+    msg: Any, image_cost: int, count_reasoning: bool = False
+) -> int:
     try:
         pins: list = []
-        key = _msg_fingerprint(msg, pins)
+        key = (_msg_fingerprint(msg, pins), count_reasoning)
         hash(key)
     except Exception:
         return (
-            _estimate_message_tokens_without_images(msg)
+            _estimate_message_tokens_without_images(msg, count_reasoning)
             + _count_image_tokens(msg, image_cost)
         )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
         return cached[1]
     tokens = (
-        _estimate_message_tokens_without_images(msg)
+        _estimate_message_tokens_without_images(msg, count_reasoning)
         + _count_image_tokens(msg, image_cost)
     )
     _MSG_TOKENS_CACHE[key] = (pins, tokens)
@@ -3351,10 +3357,29 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
-def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
+_REASONING_KEYS = ("reasoning", "reasoning_content")
+
+
+def _wire_message_shadow(
+    msg: Dict[str, Any], count_reasoning: bool = False
+) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
-    Two adjustments to the raw persisted dict:
+    Three adjustments to the raw persisted dict:
+
+    * ``reasoning`` / ``reasoning_content`` are dropped unless the caller says
+      the active endpoint echoes them back (see ``count_reasoning`` and
+      ``message_sanitization.needs_reasoning_echo``).  Only the DeepSeek, Kimi
+      and MiMo families require the echo; for every other endpoint
+      ``apply_reasoning_content_policy`` pops the field before the request is
+      built, so the thinking trace is persisted but never sent.  Counting it
+      inflates the estimate without bound on a reasoning model: one live
+      session held 109,731 chars of message content against 1,428,663 chars of
+      reasoning (the same trace stored twice, in both keys), so a transcript
+      whose real prompt was 84,611 tokens estimated at 400,298 and the turn
+      died on "Context length exceeded ... Cannot compress further" against a
+      140,000 window.  ``reasoning_details`` was already excluded here for the
+      same reason.
 
     * ``api_content`` is a SUBSTITUTE for ``content``, not an addition to it.
       ``turn_context.substitute_api_content()`` pops the sidecar and overwrites
@@ -3378,9 +3403,12 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
         and bool(sidecar)
         and msg.get("role") in ("user", "assistant")
     )
+    skip_keys = ("_anthropic_content_blocks", "reasoning_details")
+    if not count_reasoning:
+        skip_keys += _REASONING_KEYS
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details"):
+        if k in skip_keys:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
@@ -3413,7 +3441,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     return shadow
 
 
-def _estimate_message_chars(msg: Dict[str, Any]) -> int:
+def _estimate_message_chars(msg: Dict[str, Any], count_reasoning: bool = False) -> int:
     """Char count for token estimation, excluding base64 image data.
 
     Base64 images are counted via `_count_image_tokens` instead; including
@@ -3421,14 +3449,16 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     """
     if not isinstance(msg, dict):
         return len(str(msg))
-    return len(str(_wire_message_shadow(msg)))
+    return len(str(_wire_message_shadow(msg, count_reasoning)))
 
 
-def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
+def _estimate_message_tokens_without_images(
+    msg: Dict[str, Any], count_reasoning: bool = False
+) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
         return estimate_tokens_rough(str(msg))
-    return estimate_tokens_rough(str(_wire_message_shadow(msg)))
+    return estimate_tokens_rough(str(_wire_message_shadow(msg, count_reasoning)))
 
 
 def estimate_request_tokens_rough(
@@ -3437,6 +3467,7 @@ def estimate_request_tokens_rough(
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
     scale: float = 1.0,
+    count_reasoning: bool = False,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3456,7 +3487,9 @@ def estimate_request_tokens_rough(
     if system_prompt:
         total += apply_token_estimate_scale(estimate_tokens_rough(system_prompt), scale)
     if messages:
-        total += estimate_messages_tokens_rough(messages, scale=scale)
+        total += estimate_messages_tokens_rough(
+            messages, scale=scale, count_reasoning=count_reasoning
+        )
     if tools:
         total += apply_token_estimate_scale(_estimate_tools_tokens_rough(tools), scale)
     return total
