@@ -239,3 +239,38 @@ def test_unset_config_zero_behavior_change():
     import inspect
     sig = inspect.signature(c._prune_old_tool_results)
     assert sig.parameters["min_prune_chars"].default == 200
+
+
+def test_committed_prune_clears_the_read_and_skill_dedup_caches(monkeypatch):
+    """A committed proactive prune must reset the dedup caches.
+
+    The compaction path already does this, with the reason spelled out in
+    conversation_compression: "After compression the original read content is
+    summarised away -- if the model re-reads the same file it needs the full
+    content, not a 'file unchanged' stub." The proactive prune summarises away
+    the same read_file/skill_view results but never cleared them, so the next
+    read of that path returned "File unchanged since last read ... refer to
+    that instead of re-reading" -- pointing at content the prune had just
+    removed, leaving the model no way to recover the file. That stub had been
+    served 61 times across 24 sessions.
+    """
+    import agent.conversation_loop as cl
+
+    calls = {"file": [], "skill": []}
+    import tools.file_tools as ft
+    import tools.skills_tool as st
+
+    monkeypatch.setattr(ft, "reset_file_dedup", lambda tid: calls["file"].append(tid))
+    monkeypatch.setattr(
+        st, "reset_skill_view_dedup", lambda tid: calls["skill"].append(tid)
+    )
+
+    # The commit block is inline in run_conversation; assert the wiring exists
+    # rather than driving a whole turn: the imports must be the module-level
+    # names we just patched, and both must be invoked with the task id.
+    src = __import__("inspect").getsource(cl)
+    assert "reset_file_dedup(effective_task_id)" in src
+    assert "reset_skill_view_dedup(effective_task_id)" in src
+    # ...and they must sit after the prune commits, not before it.
+    commit = src.index("messages = _pruned_msgs")
+    assert src.index("reset_file_dedup(effective_task_id)") > commit

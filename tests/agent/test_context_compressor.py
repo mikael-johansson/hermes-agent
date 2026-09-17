@@ -2106,7 +2106,7 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[elided from history]")
+        assert parsed["content"].endswith("re-read with read_file if you need the content]")
         assert len(shrunk) < len(original)
 
 
@@ -2127,7 +2127,7 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[elided from history]")
+        assert parsed["note"].endswith("re-read with read_file if you need the content]")
 
 
 
@@ -2165,7 +2165,7 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[elided from history]")
+        assert parsed["content"].endswith("re-read with read_file if you need the content]")
 
 
 class TestLazyContextResolution:
@@ -3352,3 +3352,59 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestElisionMarkerCarriesSizeAndRecovery:
+    """The marker has to defeat the mis-diagnosis, not just avoid the word.
+
+    Renaming "...[truncated]" to "...[elided from history]" was not enough:
+    agents looking back at a 2KB script rendered as 200 chars still concluded
+    the write had been cut, then invented corroborating detail they could not
+    actually see -- "794 bytes, unterminated last line", "old content pasted
+    onto the tail end" -- while every file on disk was complete and bash-clean.
+    Across the session store the marker appeared in 6,611 messages over 125
+    sessions, with the assistant explicitly complaining in a dozen of them.
+    """
+
+    @staticmethod
+    def _shrink(args: str) -> dict:
+        import json as _json
+
+        from agent.context_compressor import _truncate_tool_call_args_json
+
+        return _json.loads(_truncate_tool_call_args_json(args))
+
+    def _write_call(self, content_chars: int = 2000) -> dict:
+        import json as _json
+
+        return self._shrink(
+            _json.dumps({"path": "/tmp/ada_gate3.sh", "content": "x" * content_chars})
+        )
+
+    def test_marker_states_how_much_was_elided(self):
+        parsed = self._write_call(2000)
+        # 2000 - 200 head = 1800 elided; the count is what makes "the file is
+        # 200 bytes" an impossible reading.
+        assert "+1,800 chars elided" in parsed["content"]
+
+    def test_marker_says_the_call_was_dispatched_in_full(self):
+        parsed = self._write_call()
+        assert "dispatched in full" in parsed["content"]
+        assert "complete on disk" in parsed["content"]
+
+    def test_marker_names_the_recovery_action(self):
+        parsed = self._write_call()
+        assert "read_file" in parsed["content"]
+
+    def test_marker_no_longer_reads_as_a_truncated_call(self):
+        parsed = self._write_call()
+        # The bare words that drove the mis-diagnosis must not stand alone.
+        assert "truncated" not in parsed["content"]
+
+    def test_path_and_json_validity_preserved(self):
+        parsed = self._write_call()
+        assert parsed["path"] == "/tmp/ada_gate3.sh"
+
+    def test_short_strings_are_untouched(self):
+        parsed = self._shrink('{"path": "/tmp/x.sh", "content": "short"}')
+        assert parsed["content"] == "short"

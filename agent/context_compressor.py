@@ -1189,7 +1189,22 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
                 # this way. Only the STORED TRANSCRIPT COPY is shortened; the
                 # call itself was dispatched in full and the file on disk is
                 # complete. Say so in the marker.
-                return obj[:head_chars] + "...[elided from history]"
+                #
+                # "[elided from history]" alone did not stop it: the marker has
+                # to carry the SIZE and the RECOVERY too. A model looking back
+                # at a 2KB script rendered as 200 chars still concluded the
+                # write had been cut, then invented corroborating detail it
+                # could not actually see ("794 bytes, unterminated last line",
+                # "old content pasted onto the tail end") while every file on
+                # disk was complete and bash-clean. Stating how much was elided
+                # makes that inference impossible, and naming read_file gives
+                # it something to do other than rewrite the file.
+                return obj[:head_chars] + (
+                    f"...[+{len(obj) - head_chars:,} chars elided from this "
+                    "transcript copy only — the call was dispatched in full and "
+                    "anything it wrote is complete on disk; re-read with "
+                    "read_file if you need the content]"
+                )
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}

@@ -7045,6 +7045,32 @@ def run_conversation(
                             # this turn's fresh, not-yet-persisted rows into history_ids
                             # and skip writing them.
                             messages = _pruned_msgs
+                            # Clear the read/skill-view dedup caches, exactly as
+                            # the compaction path does after it rewrites history.
+                            # This prune summarises away the same read_file and
+                            # skill_view results, so leaving the caches armed
+                            # makes the next read of that path return the "File
+                            # unchanged since last read ... refer to that instead
+                            # of re-reading" stub, pointing the model at content
+                            # this prune just removed — it then has no way to
+                            # recover the file at all. Best-effort: a dedup reset
+                            # must never fail a committed prune.
+                            try:
+                                from tools.file_tools import reset_file_dedup
+
+                                reset_file_dedup(effective_task_id)
+                            except Exception:
+                                logger.debug(
+                                    "post-prune file dedup reset failed", exc_info=True
+                                )
+                            try:
+                                from tools.skills_tool import reset_skill_view_dedup
+
+                                reset_skill_view_dedup(effective_task_id)
+                            except Exception:
+                                logger.debug(
+                                    "post-prune skill dedup reset failed", exc_info=True
+                                )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
