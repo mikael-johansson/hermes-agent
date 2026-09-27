@@ -24,6 +24,11 @@ Config via environment variables:
   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
 
+  auto_reflect (config.json, default false) — fire a background agentic reflect
+  per non-trivial turn (max one in flight); its result is injected into the NEXT
+  turn's prefetch as a dedicated "# Hindsight Reflection" section, like a
+  finished subagent re-entering the conversation one turn behind.
+
 Or via $HERMES_HOME/hindsight/config.json (profile-scoped), falling back to
 ~/.hindsight/config.json (legacy, shared) for backward compatibility.
 """
@@ -32,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
 import importlib
 import json
 import logging
@@ -742,6 +748,22 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        # Auto-reflect ("one turn behind"): a background agentic reflect fired
+        # per non-trivial turn whose result is consumed ONCE by the next turn's
+        # prefetch() as a dedicated "# Hindsight Reflection" section. Separate
+        # slot from _prefetch_result so the two consume-once semantics never
+        # interact. The future is exposed so on_session_switch/shutdown can
+        # cancel the in-flight server-side reflect (the daemon runs /reflect
+        # inline in the request task, so cancelling the aiohttp request aborts
+        # the reflect agent loop). At most one reflect is ever in flight
+        # (skip-if-busy in queue_prefetch) — the orphan pileup the old
+        # never-cancelled prefetch thread produced must not repeat here.
+        self._auto_reflect = False
+        self._reflect_result = ""
+        self._reflect_lock = threading.Lock()
+        self._reflect_future: "concurrent.futures.Future | None" = None
+        self._reflect_thread: threading.Thread | None = None
+        self._reflect_pending_query = ""
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1096,6 +1118,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
+            {"key": "auto_reflect", "description": "Fire a background agentic reflect per non-trivial turn (max one in flight); its result is injected into the NEXT turn's context as a '# Hindsight Reflection' section, one turn behind. Separate axis from recall_prefetch_method — the fast per-turn recall path keeps working unchanged. Skips trivial (<10 char) and system/delegation-notification queries (leading '[').", "default": False},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
@@ -1438,6 +1461,73 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _run_hindsight_operation_detached(self, operation, *, timeout: float):
+        """Schedule an async Hindsight client operation and return its
+        concurrent.futures.Future WITHOUT blocking for it.
+
+        Used by the background auto-reflect, whose lifetime must be
+        cancellable (session switch / shutdown) rather than bounded by the
+        caller. The returned future is exposed (callers store it in
+        ``self._reflect_future``) so the cancel paths can abort the in-flight
+        request from the loop's own thread. Retries once after an embedded
+        daemon idle-shutdown, mirroring _run_hindsight_operation, but never
+        waits: any error is recorded on the future and surfaces when the
+        caller observes it.
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+
+        def _schedule():
+            try:
+                future = safe_schedule_threadsafe(operation(client), _get_loop())
+            except Exception as exc:
+                future = concurrent.futures.Future()
+                future.set_exception(exc)
+            if future is None:
+                future = concurrent.futures.Future()
+                future.set_exception(RuntimeError("Hindsight loop unavailable"))
+            return future
+
+        client = self._get_client()
+        try:
+            return _schedule()
+        except Exception as exc:
+            if not self._is_retriable_embedded_connection_error(exc):
+                raise
+            logger.info(
+                "Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s",
+                exc,
+            )
+            self._client = None
+            client = self._get_client()
+            self._client = client
+            return _schedule()
+
+    def _cancel_reflect(self) -> None:
+        """Cancel the in-flight background auto-reflect, if any.
+
+        The daemon runs /reflect inline in the request task (no async-op
+        variant exists), so aborting the client's aiohttp request propagates
+        CancelledError into the reflect agent loop server-side. The future
+        cancel must be posted via call_soon_threadsafe because
+        concurrent.futures.Future.cancel() is not thread-safe against the
+        owning loop (CPython < 3.14).
+        """
+        future = self._reflect_future
+        if future is None or future.done():
+            return
+        loop = _get_loop()
+        try:
+            loop.call_soon_threadsafe(future.cancel)
+        except Exception as exc:
+            logger.debug("Auto-reflect cancel failed: %s", exc)
+
+    def _clear_reflect(self) -> None:
+        """Reset the auto-reflect slot so a later prefetch() injects nothing."""
+        with self._reflect_lock:
+            self._reflect_result = ""
+            self._reflect_future = None
+            self._reflect_pending_query = ""
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1570,6 +1660,14 @@ class HindsightMemoryProvider(MemoryProvider):
 
         prefetch_method = self._config.get("recall_prefetch_method") or self._config.get("prefetch_method", "recall")
         self._prefetch_method = prefetch_method if prefetch_method in {"recall", "reflect"} else "recall"
+
+        # Auto-reflect is a SEPARATE axis from recall_prefetch_method: the
+        # per-turn recall path above keeps its exact behavior; auto_reflect
+        # only adds a background reflect whose result serves the NEXT turn.
+        # Off by default — nothing changes until the user enables it.
+        self._auto_reflect = bool(self._config.get("auto_reflect", False))
+        if self._auto_reflect:
+            logger.info("Hindsight auto-reflect enabled (one-turn-behind reflection injection)")
 
         # Bank options
         self._bank_mission = self._config.get("bank_mission", "")
@@ -1720,19 +1818,29 @@ class HindsightMemoryProvider(MemoryProvider):
                 f"Relevant memories are automatically injected into context."
             )
         if self._memory_mode == "tools":
-            return (
+            block = (
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
                 f"hindsight_retain to store facts."
             )
-        return (
-            f"# Hindsight Memory\n"
-            f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
-            f"Relevant memories are automatically injected into context. "
-            f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
-        )
+        else:  # hybrid
+            block = (
+                f"# Hindsight Memory\n"
+                f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
+                f"Relevant memories are automatically injected into context. "
+                f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
+                f"hindsight_retain to store facts."
+            )
+        if self._auto_reflect:
+            block += (
+                " A synthesized reflection from your memory bank is also injected "
+                "automatically about one turn after each substantial question "
+                '(section "# Hindsight Reflection"). Use hindsight_recall/'
+                "hindsight_reflect tools for immediate lookups; do not wait for "
+                "the reflection to answer a direct question."
+            )
+        return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -1741,16 +1849,32 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
-        if not result:
+        # Auto-reflect slot: consumed once, independently of the recall slot
+        # above (which keeps its exact consume-once semantics). The reflect
+        # fired last turn lands here one turn later, like a finished subagent
+        # re-entering the conversation.
+        with self._reflect_lock:
+            reflect_text = self._reflect_result
+            self._reflect_result = ""
+        if not result and not reflect_text:
             logger.debug("Prefetch: no results available")
             return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
-        header = self._recall_prompt_preamble or (
-            "# Hindsight Memory (persistent cross-session context)\n"
-            "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
-        )
-        return f"{header}\n\n{result}"
+        parts = []
+        if result:
+            logger.debug("Prefetch: returning %d chars of context", len(result))
+            header = self._recall_prompt_preamble or (
+                "# Hindsight Memory (persistent cross-session context)\n"
+                "Use this to answer questions about the user and prior sessions. "
+                "Do not call tools to look up information that is already present here."
+            )
+            parts.append(f"{header}\n\n{result}")
+        if reflect_text:
+            logger.debug("Prefetch: returning %d chars of auto-reflect", len(reflect_text))
+            parts.append(
+                "# Hindsight Reflection (synthesized from your memory bank, "
+                f"one turn behind)\n{reflect_text}"
+            )
+        return "\n\n".join(parts)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
@@ -1805,6 +1929,127 @@ class HindsightMemoryProvider(MemoryProvider):
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
+
+        # Auto-reflect: fire-and-forget background reflect for the NEXT turn.
+        # Guarded separately from the recall path above — a query that is
+        # trivial or a system/delegation notification skips the reflect even
+        # though it still warms the fast recall cache.
+        self.queue_auto_reflect(query)
+
+    def queue_auto_reflect(self, query: str, *, session_id: str = "") -> None:
+        """Fire a background agentic reflect for the NEXT turn (auto-reflect).
+
+        Called from queue_prefetch() after the existing recall/reflect path
+        has handled the query. The result lands in a dedicated slot and is
+        consumed once by the next turn's prefetch() as a "# Hindsight
+        Reflection" section — like a finished subagent re-entering the
+        conversation one turn behind.
+
+        Rules:
+        - Gated by the auto_reflect config key (default off).
+        - SKIP-IF-BUSY: at most one reflect in flight. A new turn never
+          starts a second reflect while one is pending, so the orphan
+          pileup the old never-cancelled prefetch threads produced cannot
+          repeat.
+        - Skips trivial queries (<10 chars after strip) and
+          system/delegation/batch notification queries (leading "[") —
+          those are not substantive user questions worth an agentic
+          synthesis.
+        - The call runs on a daemon thread that blocks on the operation's
+          concurrent.futures Future; the future is stored in
+          self._reflect_future so on_session_switch() and shutdown() can
+          cancel it (aborting the server-side reflect request) and abandon
+          the result. On timeout or error the future is cleared (no result
+          stored); on success the text is stored only if this future is
+          still the current one, so a cancelled/abandoned reflect from the
+          old session can never re-populate the slot after a session switch
+          has cleared it.
+        """
+        if not self._auto_reflect:
+            return
+        if self._shutting_down.is_set():
+            logger.debug("Auto-reflect: skipped (shutting down)")
+            return
+        if len(query.strip()) < 10:
+            logger.debug("Auto-reflect: skipped (trivial query, %d chars)", len(query))
+            return
+        if query.lstrip().startswith("["):
+            logger.debug("Auto-reflect: skipped (system/delegation notification query)")
+            return
+        future = self._reflect_future
+        if future is not None and not future.done():
+            logger.debug("Auto-reflect: skipped (one already in flight)")
+            return
+
+        self._reflect_pending_query = query
+        logger.debug("Auto-reflect: firing background reflect (bank=%s, query_len=%d)",
+                     self._bank_id, len(query))
+
+        def _release_current(fut) -> None:
+            """Clear the slot if *fut* is still the current reflect."""
+            with self._reflect_lock:
+                if self._reflect_future is fut:
+                    self._reflect_future = None
+                    self._reflect_pending_query = ""
+
+        def _collect(fut) -> None:
+            """Wait for the reflect future and store the result if valid.
+
+            Runs on its own daemon thread so the scheduling in
+            queue_auto_reflect() never blocks the caller beyond the cheap
+            loop hand-off. On success the text is stored only if *fut* is
+            still the current reflect, so a cancelled/abandoned reflect from
+            an old session can never re-populate the slot after a session
+            switch has cleared it.
+            """
+            try:
+                resp = fut.result(timeout=self._timeout)
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                logger.debug("Auto-reflect cancelled")
+                _release_current(fut)
+                return
+            except concurrent.futures.TimeoutError:
+                logger.debug("Auto-reflect timed out after %ss; abandoning", self._timeout)
+                _release_current(fut)
+                return
+            except Exception as e:
+                logger.debug("Auto-reflect failed: %s", e, exc_info=True)
+                _release_current(fut)
+                return
+            text = str(getattr(resp, "text", "") or "").strip()
+            if text:
+                # Check-and-store atomically: a session switch / shutdown may
+                # have cleared the slot (and swapped the future) between the
+                # result arriving and us storing it; never re-populate a slot
+                # that a switch already reset for the new session.
+                with self._reflect_lock:
+                    if self._reflect_future is fut and not self._shutting_down.is_set():
+                        self._reflect_result = text
+            _release_current(fut)
+
+        # Schedule the request on the shared loop WITHOUT blocking for it.
+        # Done synchronously (microseconds — a call_soon_threadsafe hand-off)
+        # so the skip-if-busy check in the next queue_prefetch() is
+        # deterministic: the future is stored before this method returns.
+        try:
+            fut = self._run_hindsight_operation_detached(
+                lambda client: client.areflect(
+                    bank_id=self._bank_id, query=query, budget=self._budget
+                ),
+                timeout=self._timeout,
+            )
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            logger.debug("Auto-reflect cancelled")
+            return
+        except Exception as e:
+            logger.debug("Auto-reflect scheduling failed: %s", e, exc_info=True)
+            return
+        with self._reflect_lock:
+            self._reflect_future = fut
+        self._reflect_thread = threading.Thread(
+            target=_collect, args=(fut,), daemon=True, name="hindsight-auto-reflect"
+        )
+        self._reflect_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -2091,7 +2336,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
         Also wait for any in-flight prefetch from the old session and drop
         its cached result; otherwise the new session's first ``prefetch()``
-        could read stale recall text from before the switch.
+        could read stale recall text from before the switch. Likewise, any
+        in-flight auto-reflect is cancelled (server-side) and its dedicated
+        slot cleared, so the new session's first turn never consumes a
+        reflection synthesized for the old session's question.
 
         ``parent_session_id`` is recorded for lineage tags on future retains.
         ``reset`` is accepted but not needed for Hindsight's state model —
@@ -2172,6 +2420,17 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_result = ""
 
+        # 2b. Abandon any in-flight auto-reflect from the old session:
+        # cancel the server-side request and clear the dedicated slot so
+        # the new session's first turn cannot consume a reflection that was
+        # synthesized for the previous session's question.
+        self._cancel_reflect()
+        reflect_thread = self._reflect_thread
+        if reflect_thread is not None and reflect_thread.is_alive():
+            reflect_thread.join(timeout=1.0)
+        self._clear_reflect()
+        self._reflect_thread = None
+
         # 3. Now rotate to the new session.
         if parent_session_id:
             self._parent_session_id = str(parent_session_id).strip()
@@ -2210,6 +2469,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
+        # Abandon any in-flight auto-reflect and clear its slot
+        # unconditionally: the process is going away, and a result arriving
+        # after the client is closed would be stale anyway.
+        self._cancel_reflect()
+        if self._reflect_thread is not None and self._reflect_thread.is_alive():
+            self._reflect_thread.join(timeout=1.0)
+        self._clear_reflect()
+        self._reflect_thread = None
         if self._client is not None:
             try:
                 if self._mode == "local_embedded":
