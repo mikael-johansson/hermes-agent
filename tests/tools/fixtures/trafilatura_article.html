@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Trafilatura Fixture: The History of Web Scraping</title>
+  <meta name="description" content="A short fixture article used to test the trafilatura extract provider.">
+  <meta name="author" content="Hermes Test">
+</head>
+<body>
+  <header>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/about">About</a>
+      <a href="/blog">Blog</a>
+      <a href="/contact">Contact</a>
+    </nav>
+  </header>
+  <main>
+    <article>
+      <h1>The History of Web Scraping</h1>
+      <p>Web scraping is the automated extraction of data from websites. It has
+      been a core practice on the open web since the earliest days of the
+      internet, long before search engines and APIs made structured data easy
+      to obtain.</p>
+      <p>Early scrapers were simple line-oriented text parsers that walked HTML
+      byte by byte. Modern extraction libraries instead parse the document into
+      a tree, then apply a series of heuristics to separate the main content
+      from navigation, advertising, and footer material.</p>
+      <h2>Why local extraction matters</h2>
+      <p>Extracting content locally, rather than handing the raw page to a
+      third-party cloud API, keeps the data on the user's own machine. This is
+      a meaningful privacy property: no page body ever leaves the box except as
+      the plain HTTP request needed to fetch it in the first place.</p>
+      <p>This paragraph is deliberately long enough that a content-detection
+      heuristic should flag the article block as the dominant text region of the
+      page. The surrounding navigation and footer links are short and should be
+      stripped out by the extractor.</p>
+    </article>
+  </main>
+  <footer>
+    <p>&copy; 2026 Hermes Test. All rights reserved.</p>
+    <a href="/privacy">Privacy Policy</a>
+    <a href="/terms">Terms of Service</a>
+    <a href="/rss">RSS Feed</a>
+  </footer>
+</body>
+</html>
