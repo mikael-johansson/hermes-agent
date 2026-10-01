@@ -560,6 +560,223 @@ def _get_cdp_override() -> str:
     return _resolve_cdp_override(raw)
 
 
+# ============================================================================
+# Raw-CDP stale-target cleanup (adopted ``cdp_url`` sessions)
+# ============================================================================
+#
+# Adopted CDP sessions (``browser.cdp_url`` / ``BROWSER_CDP_URL``) usually
+# point at a browser that Hermes did NOT spawn — e.g. the
+# ``hermes-browser-box`` container whose Chromium is PID 1 and outlives every
+# gateway process.  For such endpoints ``agent-browser --cdp <url> close``
+# only detaches the *caller's* client and, in practice, hangs until the 10 s
+# command timeout (verified in investigations/web-browser-tools-fix/b_diag.md)
+# while leaving every tab in place.  The only mechanism that actually closes
+# tabs without killing the browser is raw CDP: enumerate targets over the
+# browser-level websocket (``Target.getTargets``) and close the stale ones
+# (``Target.closeTarget``).
+
+def _cdp_ws_url_for(cdp_url: str) -> str:
+    """Resolve a CDP endpoint to its browser-level websocket URL.
+
+    Accepts an already-resolved ``ws://``/``wss://`` endpoint or an HTTP
+    discovery endpoint (fetches ``/json/version``).  Returns ``""`` when the
+    endpoint is dead/unresolvable — discovery failures are logged and
+    swallowed so cleanup stays best-effort and can never break the session
+    lifecycle.
+    """
+    raw = (cdp_url or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if lowered.startswith(("ws://", "wss://")):
+        return raw
+    if not lowered.startswith(("http://", "https://")):
+        logger.debug(
+            "CDP cleanup: unsupported endpoint scheme %s; skipping",
+            _sanitize_url_for_logs(raw),
+        )
+        return ""
+
+    version_url = raw if lowered.endswith("/json/version") else raw.rstrip("/") + "/json/version"
+    try:
+        import requests  # lazy — shared module object, test patches still apply
+
+        response = requests.get(version_url, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        logger.debug(
+            "CDP cleanup: /json/version discovery failed for %s: %s",
+            _sanitize_url_for_logs(version_url),
+            _sanitize_url_for_logs(exc),
+        )
+        return ""
+
+    return str(payload.get("webSocketDebuggerUrl") or "").strip()
+
+
+def _is_stale_cdp_target(target: Dict[str, Any]) -> bool:
+    """Heuristic: is this a stale *page* worth closing?
+
+    Only ``page`` targets with a real (non-blank) URL are closed.  Blank
+    pages, iframes, workers and other target types are never touched —
+    iframes/workers die with their parent page anyway.  Verified safe on a
+    117-target container browser (b_diag.md): closing stale pages leaves the
+    Chromium process alive.
+    """
+    if target.get("type") != "page":
+        return False
+    url = (target.get("url") or "").strip()
+    return url not in ("", "about:blank")
+
+
+def _close_stale_cdp_targets(
+    ws_url: str,
+    *,
+    protect_urls: Tuple[str, ...] = (),
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """Close stale page targets on a browser-level CDP websocket.
+
+    Verified safe recipe (b_diag.md): connect with the ``websockets`` library
+    (which sends NO Origin header by default — do NOT pass
+    websocket-client's ``suppress_origin`` kwarg here, it raises TypeError on
+    ``websockets``), send ``Target.getTargets``, then ``Target.closeTarget``
+    per stale page.  The browser process itself is never touched.
+
+    Args:
+        ws_url: Browser-level websocket (``ws://.../devtools/browser/<id>``).
+        protect_urls: URLs (exact or prefix in either direction) to keep —
+            e.g. the last URL of a session whose bookkeeping we are about to
+            drop, so an active page is not yanked out from under its task.
+        timeout: Per-CDP-message timeout in seconds.
+
+    Returns:
+        ``{"ws_url", "total", "stale", "closed", "failed", "errors"}``.
+        Never raises — cleanup paths must stay best-effort.
+    """
+    summary: Dict[str, Any] = {
+        "ws_url": ws_url,
+        "total": 0,
+        "stale": 0,
+        "closed": 0,
+        "failed": 0,
+        "errors": [],
+    }
+    if not ws_url:
+        return summary
+
+    def _is_protected(url: str) -> bool:
+        url = (url or "").strip()
+        if not url or url == "about:blank":
+            return False
+        return any(
+            p and (url == p or url.startswith(p) or p.startswith(url))
+            for p in protect_urls
+        )
+
+    import asyncio
+
+    async def _run() -> None:
+        import websockets
+
+        try:
+            async with websockets.connect(ws_url, max_size=2 ** 22, open_timeout=10) as ws:
+                await ws.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+                targets = (resp.get("result") or {}).get("targetInfos") or []
+                summary["total"] = len(targets)
+                stale = [
+                    t for t in targets
+                    if _is_stale_cdp_target(t) and not _is_protected(t.get("url", ""))
+                ]
+                summary["stale"] = len(stale)
+                for idx, t in enumerate(stale):
+                    msg_id = 2 + idx
+                    try:
+                        await ws.send(json.dumps({
+                            "id": msg_id,
+                            "method": "Target.closeTarget",
+                            "params": {"targetId": t["id"]},
+                        }))
+                        r = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+                        if r.get("id") == msg_id and r.get("result", {}).get("success"):
+                            summary["closed"] += 1
+                        else:
+                            summary["failed"] += 1
+                            summary["errors"].append(f"{t.get('id')}: {r}")
+                    except Exception as exc:
+                        summary["failed"] += 1
+                        summary["errors"].append(f"{t.get('id')}: {exc}")
+        except Exception as exc:
+            summary["failed"] = max(summary["stale"], 1)
+            summary["errors"].append(f"websocket: {_sanitize_url_for_logs(str(exc))}")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        summary["errors"].append(_sanitize_url_for_logs(str(exc)))
+    return summary
+
+
+def _sweep_stale_cdp_targets() -> None:
+    """Startup sweep: close stale pages on the configured adopted CDP endpoint.
+
+    In-memory session bookkeeping (``_active_sessions`` /
+    ``_session_last_activity``) is lost on every gateway/container restart,
+    but an adopted, container-owned browser (Chromium = container PID 1) is
+    not.  Without this sweep, tabs accumulate across process lifetimes and
+    nothing ever reaps them — the 117-tabs-since-Aug-31 condition.
+
+    Runs once per process lifetime (invoked from the inactivity cleanup
+    thread's startup, after a grace period so a session created by the call
+    that started the thread records its ``last_url`` first).  Best-effort:
+    any failure is logged and swallowed.  Targets matching this process's
+    active sessions' last URLs are protected.
+    """
+    try:
+        raw = _get_cdp_override_raw()
+    except Exception as exc:
+        logger.debug("Startup CDP sweep: no override resolvable: %s", exc)
+        return
+    if not raw:
+        return
+
+    ws_url = _cdp_ws_url_for(raw)
+    if not ws_url:
+        logger.debug(
+            "Startup CDP sweep: no browser websocket for %s; skipping",
+            _sanitize_url_for_logs(raw),
+        )
+        return
+
+    protect: List[str] = []
+    try:
+        with _cleanup_lock:
+            for info in list(_active_sessions.values()):
+                url = str(info.get("last_url") or "").strip()
+                if url and url != "about:blank":
+                    protect.append(url)
+    except Exception:
+        pass
+
+    summary = _close_stale_cdp_targets(ws_url, protect_urls=tuple(protect))
+    if summary["stale"]:
+        logger.info(
+            "Startup CDP sweep on %s: %d targets, closed %d stale page(s) (%d failed)",
+            _sanitize_url_for_logs(raw),
+            summary["total"],
+            summary["closed"],
+            summary["failed"],
+        )
+    elif summary["errors"]:
+        logger.debug(
+            "Startup CDP sweep on %s skipped with errors: %s",
+            _sanitize_url_for_logs(raw),
+            summary["errors"],
+        )
+
+
 def _get_dialog_policy_config() -> Tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s`` from config.
 
@@ -1569,6 +1786,8 @@ _session_last_activity: Dict[str, float] = {}
 # Background cleanup thread state
 _cleanup_thread = None
 _cleanup_running = False
+# Set when the startup CDP sweep has run (once per process lifetime).
+_cdp_startup_sweep_done = False
 # Protects _session_last_activity AND _active_sessions for thread safety
 # (subagents run concurrently via ThreadPoolExecutor)
 _cleanup_lock = threading.Lock()
@@ -1931,6 +2150,23 @@ def _browser_cleanup_thread_worker():
         _reap_orphaned_browser_sessions()
     except Exception as e:
         logger.warning("Orphan reap error: %s", e)
+
+    # One-time raw-CDP sweep of the configured adopted (cdp_url) endpoint.
+    # In-memory bookkeeping is lost on every process/container restart, but a
+    # container-owned adopted browser (Chromium = container PID 1) is not, so
+    # stale tabs would accumulate forever without this sweep (117 tabs since
+    # Aug 31).  Runs once per process lifetime, after a grace period so a
+    # session created by the call that started this thread has recorded its
+    # last_url before the sweep computes its protect list.
+    global _cdp_startup_sweep_done
+    if not _cdp_startup_sweep_done:
+        _cdp_startup_sweep_done = True
+        try:
+            time.sleep(5)
+            if _cleanup_running:
+                _sweep_stale_cdp_targets()
+        except Exception as e:
+            logger.warning("Startup CDP sweep error: %s", e)
 
     while _cleanup_running:
         try:
@@ -3148,6 +3384,17 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Failed opens and blocked redirects must not retarget follow-up clicks
         # or snapshots to a newly-created but irrelevant session.
         _last_active_session_key[effective_task_id] = nav_session_key
+        # Record the page the session is now showing. Adopted cdp_url sessions
+        # (container-owned browsers) outlive the process, so on the next
+        # startup sweep this URL identifies the live target to protect from
+        # being closed while the bookkeeping says the session is gone.
+        try:
+            with _cleanup_lock:
+                info = _active_sessions.get(nav_session_key)
+            if isinstance(info, dict):
+                info["last_url"] = final_url
+        except Exception:
+            pass
         _copy_fallback_warning(response, result)
 
         # Detect common "blocked" page patterns from title/url
@@ -4642,14 +4889,58 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                 task_id,
             )
         else:
-            try:
-                _run_browser_command(task_id, "close", [], timeout=10)
-                logger.debug(
-                    "agent-browser close command completed for task %s",
-                    task_id,
-                )
-            except Exception as e:
-                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+            # Adopted CDP sessions (browser.cdp_url / BROWSER_CDP_URL): the
+            # browser is owned by something external (e.g. the
+            # hermes-browser-box container, Chromium = PID 1) and
+            # `agent-browser --cdp <url> close` is a proven hang + no-op for
+            # it (b_diag.md).  Close the session's targets over raw CDP
+            # instead: enumerate Target.getTargets on the browser websocket
+            # and Target.closeTarget the stale pages.  Protect the page the
+            # session last navigated to — for a *still-active* session
+            # (cleanup triggered by expiry replacement, not inactivity) that
+            # page is in use and must survive; for an inactive session the
+            # last_url heuristic is a conservative "don't yank the one page
+            # we know about" guard while the sweep/reaper handle the rest.
+            cdp_url = str(session_info.get("cdp_url") or "").strip()
+            if cdp_url:
+                try:
+                    ws_url = _cdp_ws_url_for(cdp_url)
+                    if not ws_url:
+                        # Endpoint unreachable: nothing to close; drop the
+                        # bookkeeping (below) and move on.
+                        logger.debug(
+                            "CDP cleanup for task %s: endpoint %s unreachable",
+                            task_id, _sanitize_url_for_logs(cdp_url),
+                        )
+                    else:
+                        last_url = str(session_info.get("last_url") or "").strip()
+                        summary = _close_stale_cdp_targets(
+                            ws_url,
+                            protect_urls=(last_url,) if last_url else (),
+                        )
+                        logger.info(
+                            "CDP cleanup for task %s on %s: %d targets, closed "
+                            "%d stale page(s) (%d failed)",
+                            task_id,
+                            _sanitize_url_for_logs(cdp_url),
+                            summary["total"],
+                            summary["closed"],
+                            summary["failed"],
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Raw-CDP stale-target cleanup failed for task %s: %s",
+                        task_id, e,
+                    )
+            else:
+                try:
+                    _run_browser_command(task_id, "close", [], timeout=10)
+                    logger.debug(
+                        "agent-browser close command completed for task %s",
+                        task_id,
+                    )
+                except Exception as e:
+                    logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
         # Now remove from tracking under lock
         with _cleanup_lock:
