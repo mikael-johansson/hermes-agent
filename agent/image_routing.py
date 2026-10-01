@@ -506,6 +506,49 @@ def decide_image_input_mode(
     return "text"
 
 
+# Per-prompt image-count safety net (``agent.max_images_per_prompt``).
+# Native-vision sessions accumulate image content parts over time (one per
+# vision_analyze fast-path result, plus user-attached images). Token-based
+# aging (proactive prune / compression) does not bound the *count*, so a
+# provider that caps per-prompt images (e.g. a vLLM backend at 50) 400s
+# even at low token counts. The default sits above the known server caps so
+# it only fires for genuinely pathological accumulation; set it to the
+# server's actual cap to enforce it exactly, or 0/negative to disable the
+# prune entirely.
+DEFAULT_MAX_IMAGES_PER_PROMPT = 64
+
+
+def max_images_per_prompt(cfg: Optional[Dict[str, Any]]) -> int:
+    """Resolve ``agent.max_images_per_prompt`` from a loaded config dict.
+
+    Returns the parsed cap, or ``DEFAULT_MAX_IMAGES_PER_PROMPT`` when the
+    key is absent/unset. Parsing mirrors the repo's hardened int semantics
+    (cf. ``agent_init._parse_prune_int``): booleans rejected (bool subclasses
+    int — YAML ``true`` must not coerce to 1), fractional floats rejected
+    rather than truncated, integral floats and numeric strings accepted,
+    anything else falls back to the default. 0 (and negative values) mean
+    *disabled* and are returned as 0, not coerced to the default — an
+    explicit opt-out is an operator decision.
+    """
+    raw: Any = None
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            raw = agent_cfg.get("max_images_per_prompt")
+    if raw is None:
+        return DEFAULT_MAX_IMAGES_PER_PROMPT
+    if isinstance(raw, bool):
+        return DEFAULT_MAX_IMAGES_PER_PROMPT
+    if isinstance(raw, int):
+        return max(0, raw)
+    if isinstance(raw, float):
+        return max(0, int(raw)) if raw.is_integer() else DEFAULT_MAX_IMAGES_PER_PROMPT
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_IMAGES_PER_PROMPT
+
+
 # Image size handling is REACTIVE rather than proactive: we attempt native
 # attachment at full size regardless of provider, and rely on
 # ``run_agent._try_shrink_image_parts_in_messages`` to shrink + retry if
@@ -818,4 +861,6 @@ __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
     "extract_image_refs",
+    "max_images_per_prompt",
+    "DEFAULT_MAX_IMAGES_PER_PROMPT",
 ]

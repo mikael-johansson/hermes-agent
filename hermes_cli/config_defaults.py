@@ -266,6 +266,19 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # Per-prompt image-count budget for the send path (the count-based
+        # safety net in conversation_loop._prune_image_parts_in_api_messages).
+        # Native-vision sessions accumulate image content parts over time; a
+        # provider that caps the *count* of per-prompt images (e.g. a vLLM
+        # backend at 50) 400s once the outgoing request exceeds it even at
+        # low token counts, where token-based aging never fires. When the
+        # request has more image parts than this cap, the OLDEST are
+        # replaced with short text stubs (with the on-disk path ref when
+        # available) and the newest N are kept. The default (64) sits above
+        # known server caps so it only fires for genuinely pathological
+        # accumulation — set it to your server's actual cap to enforce it
+        # exactly. 0 / negative = disabled (no count-based prune).
+        "max_images_per_prompt": 64,
         "disabled_toolsets": [],
 
         # Per-model reasoning effort overrides (spelling-tolerant).

@@ -1240,6 +1240,33 @@ def _content_has_images(content: Any) -> bool:
     return any(_is_image_part(p) for p in content)
 
 
+def _multimodal_envelope_path_ref(content: Any) -> Optional[str]:
+    """On-disk path reference carried by a ``_multimodal`` envelope, if any.
+
+    Fast-path tool results (``tools/vision_tools._build_native_vision_tool_result``,
+    computer_use screenshots) wrap their image parts in a dict envelope:
+    ``{"_multimodal": True, "content": [...], "text_summary": ...,
+    "meta": {"image_url": <original path/URL>, ...}}``. The image part
+    itself is a data: URL with no usable ref, so ``meta.image_url`` is the
+    only stable pointer to the underlying file — used by the per-prompt
+    image-count prune to name it in its stub. Returns None when absent,
+    blank, or a data: URL (a second data: URL adds nothing the part
+    already says).
+    """
+    if not isinstance(content, dict) or not content.get("_multimodal"):
+        return None
+    meta = content.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    ref = meta.get("image_url")
+    if not isinstance(ref, str):
+        return None
+    ref = ref.strip()
+    if not ref or ref.startswith("data:"):
+        return None
+    return ref
+
+
 def _strip_images_from_content(content: Any) -> Any:
     """Return a copy of ``content`` with every image part replaced by a
     short text placeholder.

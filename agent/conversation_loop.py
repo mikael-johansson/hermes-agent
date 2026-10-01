@@ -42,6 +42,7 @@ from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
     compose_user_api_content,
+    drop_stale_api_content,
     reanchor_current_turn_user_idx,
     _agent_estimate_scale,
 )
@@ -58,6 +59,19 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+)
+# Per-prompt image-count prune: reuses the shared image-part detectors and
+# the envelope path-ref helper from context_compressor, plus the config
+# resolver from image_routing. None of these import conversation_loop, so
+# there is no circular import (verified: context_compressor ->
+# auxiliary_client, image_routing -> stdlib only).
+from agent.context_compressor import (
+    _is_image_part,
+    _multimodal_envelope_path_ref,
+)
+from agent.image_routing import (
+    DEFAULT_MAX_IMAGES_PER_PROMPT,
+    max_images_per_prompt,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -105,6 +119,15 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+
+# Text stub used by the per-prompt image-count prune to replace an image
+# content part that exceeded the ``agent.max_images_per_prompt`` budget.
+# Follows the repo's bracketed marker style (see context_compressor's
+# "[screenshot removed to save context]" / "[Attached image — stripped after
+# compression]"). A path ref, when available, is appended by the prune.
+_IMAGE_PRUNE_STUB_TEXT = (
+    "[image removed to stay within the per-prompt image budget]"
+)
 
 
 def _restore_user_after_reference_handoff(
@@ -1287,6 +1310,119 @@ def _redecorate_prompt_cache_for_provider(
     return messages, prepared, planned_tools
 
 
+def _prune_image_parts_in_api_messages(
+    api_messages: List[Dict[str, Any]],
+    *,
+    cap: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
+    """Bound the number of image content-parts in the outgoing request.
+
+    Native-vision sessions accumulate image parts over time (one per
+    ``vision_analyze`` fast-path tool result, plus user-attached images).
+    Existing aging is *token*-based (proactive prune / compression); a
+    provider with a per-prompt *count* cap on images (e.g. a vLLM backend
+    at 50) 400s when the outgoing request exceeds it — even at low token
+    counts, so no token-based pass ever fires. This is the count-based
+    safety net: keep the ``cap`` newest image parts, replace every older
+    one with a short text stub (carrying the on-disk path ref when the
+    part/envelope has one).
+
+    Mutates ``api_messages`` in place — the per-call copy built by
+    ``run_conversation`` (see ``_clone_message_for_send``) — and returns
+    it. The stored conversation history is never touched. Messages are
+    never deleted, so tool_call_id pairing survives a stubbed tool result.
+
+    ``cap`` defaults to ``agent.max_images_per_prompt`` (default 64) read
+    via the shared config loader; 0 / negative disables the prune (no-op).
+    Fails open: any config/parse error leaves the request untouched.
+
+    One info line is logged per turn in which the prune fires (pruned
+    count, kept count, cap).
+    """
+    if cap is None:
+        try:
+            from hermes_cli import config as _cfg_mod
+
+            cap = max_images_per_prompt(_cfg_mod.load_config_readonly())
+        except Exception:
+            cap = DEFAULT_MAX_IMAGES_PER_PROMPT
+    if cap <= 0:
+        return api_messages
+
+    # Collect (message idx, part idx) of every image part, oldest → newest.
+    # Handles both list-style content (user-attached images) and the
+    # ``_multimodal`` dict envelopes that fast-path tool results carry (their
+    # inner ``content`` list holds the image parts).
+    image_sites: List[tuple] = []
+    for m_idx, msg in enumerate(api_messages):
+        content = msg.get("content")
+        parts: Any = None
+        if isinstance(content, list):
+            parts = content
+        elif isinstance(content, dict) and content.get("_multimodal"):
+            parts = content.get("content")
+        if not isinstance(parts, list):
+            continue
+        for p_idx, part in enumerate(parts):
+            if _is_image_part(part):
+                image_sites.append((m_idx, p_idx))
+
+    if len(image_sites) <= cap:
+        return api_messages
+
+    # Keep the ``cap`` newest; stub out every older one.
+    keep = set(image_sites[-cap:])
+    pruned = 0
+    pruned_msgs: set = set()
+    for m_idx, p_idx in image_sites:
+        if (m_idx, p_idx) in keep:
+            continue
+        msg = api_messages[m_idx]
+        content = msg.get("content")
+        if isinstance(content, list):
+            # Replace this one image part with a text stub in place; the
+            # message (and its remaining parts) stays.
+            msg["content"][p_idx] = {
+                "type": "text",
+                "text": _IMAGE_PRUNE_STUB_TEXT,
+            }
+            pruned += 1
+        elif isinstance(content, dict) and content.get("_multimodal"):
+            # Replace the whole envelope with a one-line stub: the budget
+            # marker + the text_summary prefix (when present) + the on-disk
+            # path ref from meta.image_url (when usable).
+            stub_parts = [_IMAGE_PRUNE_STUB_TEXT]
+            summary = content.get("text_summary")
+            if isinstance(summary, str) and summary.strip():
+                stub_parts.append(summary.strip()[:200])
+            path_ref = _multimodal_envelope_path_ref(content)
+            if path_ref:
+                stub_parts.append(f"(image: {path_ref})")
+            msg["content"] = " ".join(stub_parts)
+            pruned += 1
+        pruned_msgs.add(m_idx)
+
+    # Content was rewritten on these messages — their api_content sidecar
+    # (exact bytes sent last time) is now stale and must be dropped so
+    # replay can't resend the pre-rewrite bytes.
+    for m_idx in pruned_msgs:
+        drop_stale_api_content(api_messages[m_idx])
+
+    if logger is not None:
+        try:
+            logger.info(
+                "per-prompt image-count prune: pruned %d image(s), kept %d "
+                "(cap=%d)",
+                pruned,
+                len(keep),
+                cap,
+            )
+        except Exception:
+            pass
+    return api_messages
+
+
 def _apply_context_engine_selection(
     agent: Any,
     api_messages: List[Dict[str, Any]],
@@ -2073,6 +2209,18 @@ def run_conversation(
         api_messages = agent._drop_thinking_only_and_merge_users(
             api_messages,
             drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+        )
+
+        # Count-based per-prompt image-budget safety net. Native-vision
+        # sessions accumulate image parts (one per vision_analyze fast-path
+        # result, plus user-attached images); token-based aging never fires
+        # on a provider that caps *count*, so bound the count here on the
+        # per-call copy (oldest → text stub, newest N kept). Runs AFTER the
+        # thinking-only drop and BEFORE cache planning so the cache plan
+        # sees the final message shape. No-op at/below the cap; disabled at
+        # 0/negative. Never touches the stored history.
+        api_messages = _prune_image_parts_in_api_messages(
+            api_messages, logger=request_logger
         )
 
         # Normalize message whitespace and tool-call JSON for consistent
