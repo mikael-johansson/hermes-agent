@@ -23,9 +23,14 @@ Per-URL pipeline (see :meth:`extract`):
   2. Fetch — httpx GET with a browser User-Agent and follow_redirects, run in
      a worker thread and bounded by a per-URL ``asyncio.wait_for`` timeout
      (~60s) so a hung page cannot wedge the agent loop.
-  3. Extract — ``trafilatura.extract(output_format='markdown',
-     with_metadata=True)`` → (markdown, metadata). trafilatura is
-     lazy-imported so there is no cold-start cost on a checkout without it.
+  3. Extract — branch on the fetched bytes:
+       - PDF (magic bytes ``b'%PDF-'``) → local text extraction with PyMuPDF
+         (all pages joined; page count + ``pdf: true`` in metadata; title
+         from the PDF's own metadata or the URL basename);
+       - HTML → ``trafilatura.extract(output_format='markdown',
+         with_metadata=True)`` → (markdown, metadata).
+     Both libraries are lazy-imported so there is no cold-start cost on a
+     checkout without them.
 
 The heavy helpers are module-level functions (``_fetch_url`` /
 ``_extract_markdown``) rather than closures so unit tests can monkeypatch the
@@ -66,6 +71,14 @@ _ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.
 # import it on first real use (and only then when it is available). The result
 # is cached on a module global so we pay the import once per process.
 _TRAFILATURA_MOD: Optional[Any] = None
+
+# PDF magic bytes: every well-formed PDF file starts with b'%PDF-'.
+_PDF_MAGIC = b"%PDF-"
+
+
+def _is_pdf(data: bytes) -> bool:
+    """True when the fetched buffer starts with the PDF magic bytes."""
+    return isinstance(data, (bytes, bytearray)) and bytes(data[:5]) == _PDF_MAGIC
 
 
 def _load_trafilatura() -> Any:
@@ -183,6 +196,73 @@ def _extract_markdown(html: bytes) -> tuple[str, Dict[str, Any]]:
     # String with (possibly) a leading front-matter metadata block.
     content, metadata = _split_frontmatter(str(result))
     return (content or ""), metadata
+
+
+def _load_pymupdf() -> Any:
+    """Import and cache PyMuPDF.
+
+    Tries the modern ``pymupdf`` name first (PyMuPDF >= 1.24), falling back to
+    the deprecated ``fitz`` alias for older installs. Lazy + cached so there is
+    no cold-start cost on a checkout without the package. Raises
+    ``ImportError`` when neither module is importable so the caller can
+    surface a clear install hint.
+    """
+    global _PYMUPDF_MOD
+    if _PYMUPDF_MOD is None:
+        try:
+            import pymupdf  # noqa: WPS433 — deliberately lazy
+
+            _PYMUPDF_MOD = pymupdf
+        except ImportError:
+            import fitz  # deprecated alias; kept for pre-1.24 installs
+
+            _PYMUPDF_MOD = fitz
+    return _PYMUPDF_MOD
+
+
+_PYMUPDF_MOD: Optional[Any] = None
+
+
+def _extract_pdf_text(data: bytes, url: str) -> tuple[str, Dict[str, Any]]:
+    """Extract text from raw PDF *data* with PyMuPDF; return (text, metadata).
+
+    Joins the text of every page (page text extracted with
+    ``page.get_text()``). Metadata carries the page count, a ``pdf: True``
+    flag, and the title from the PDF's own ``/Title`` field when present
+    (otherwise the URL's basename).
+
+    Raises ``LookupError`` (message 'pymupdf not installed') when PyMuPDF is
+    not importable, and ``ValueError`` (scanned-PDF message) when the PDF has
+    no embedded text layer — callers map these to the corresponding per-URL
+    error items.
+    """
+    try:
+        mod = _load_pymupdf()
+    except ImportError:
+        raise LookupError("pymupdf not installed") from None
+
+    doc = mod.open(stream=bytes(data))
+    try:
+        pages = [page.get_text() for page in doc]
+        text = "\n".join(pages).strip()
+        if not text:
+            # No embedded text layer: scanned / image-only PDF. web_extract
+            # does not OCR.
+            raise ValueError(
+                "no embedded text (scanned/image-only PDF; OCR not supported by web_extract)"
+            )
+        pdf_meta = doc.metadata or {}
+        title = (pdf_meta.get("title") or "").strip()
+        if not title:
+            base = url.rsplit("/", 1)[-1]
+            title = base.rsplit("?", 1)[0]
+        metadata: Dict[str, Any] = dict(pdf_meta)
+        metadata["title"] = title
+        metadata["pdf"] = True
+        metadata["page_count"] = int(doc.page_count)
+        return text, metadata
+    finally:
+        doc.close()
 
 
 class TrafilaturaProvider(WebSearchProvider):
@@ -317,7 +397,61 @@ class TrafilaturaProvider(WebSearchProvider):
                 )
                 continue
 
-            # Local trafilatura extraction.
+            # Local extraction, branched on content type.
+            if _is_pdf(html):
+                # PDF → local PyMuPDF text extraction (not trafilatura).
+                try:
+                    content, metadata = _extract_pdf_text(html, url)
+                except LookupError as pdf_mod_err:
+                    results.append(
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "metadata": {"pdf": True},
+                            "error": str(pdf_mod_err),
+                        }
+                    )
+                    continue
+                except ValueError as pdf_text_err:
+                    results.append(
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "metadata": {"pdf": True},
+                            "error": str(pdf_text_err),
+                        }
+                    )
+                    continue
+                except Exception as pdf_err:  # noqa: BLE001
+                    logger.debug("PDF extraction failed for %s: %s", url, pdf_err)
+                    results.append(
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "metadata": {},
+                            "error": f"PDF extraction failed: {pdf_err}",
+                        }
+                    )
+                    continue
+
+                results.append(
+                    {
+                        "url": url,
+                        "title": metadata.get("title", ""),
+                        "content": content,
+                        "raw_content": content,
+                        "metadata": metadata,
+                    }
+                )
+                continue
+
+            # HTML → trafilatura.
             try:
                 content, metadata = _extract_markdown(html)
             except Exception as extract_err:  # noqa: BLE001

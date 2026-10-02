@@ -163,3 +163,127 @@ class TestMissingPackage:
             results = _run(TrafilaturaProvider().extract([FIXTURE_URL]))
         assert len(results) == 1
         assert "trafilatura package is not installed" in results[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# PDF branch: magic-byte routing + local PyMuPDF text extraction
+# ---------------------------------------------------------------------------
+
+
+def _make_text_pdf(title: str = "", body: str = "Hello PDF world.") -> bytes:
+    """Generate an in-memory, single-page PDF with an embedded text layer."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    if title:
+        doc.set_metadata({"title": title})
+    page = doc.new_page()
+    page.insert_text((72, 72), body)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _make_no_text_pdf() -> bytes:
+    """Generate a minimal valid PDF with no text (scanned/image-only analogue)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page()  # blank page: no text, no drawings
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+PDF_URL = "https://example.com/papers/2101.00075v1.pdf"
+
+
+class TestPdfBranch:
+    def test_is_pdf_magic_bytes(self):
+        assert traf_mod._is_pdf(b"%PDF-1.5 rest") is True
+        assert traf_mod._is_pdf(bytearray(b"%PDF-1.7")) is True
+        # Negative: HTML and other non-PDF buffers are not treated as PDF.
+        assert traf_mod._is_pdf(b"<html><body>hi</body></html>") is False
+        assert traf_mod._is_pdf(b"\x00\x01\x02") is False
+        assert traf_mod._is_pdf(b"%PDFX1.5") is False  # wrong 4th char
+
+    def test_fixture_pdf_extract_helper_text_and_page_count(self):
+        data = _make_text_pdf(title="A Fixture Paper", body="Hello PDF world.")
+        text, metadata = traf_mod._extract_pdf_text(data, PDF_URL)
+        assert "Hello PDF world." in text
+        assert text.strip(), "extracted PDF text must be non-empty"
+        assert metadata["pdf"] is True
+        assert metadata["page_count"] == 1
+        # Title comes from the PDF's own metadata.
+        assert metadata["title"] == "A Fixture Paper"
+
+    def test_title_falls_back_to_url_basename(self):
+        data = _make_text_pdf(title="", body="No title here.")
+        _, metadata = traf_mod._extract_pdf_text(data, PDF_URL)
+        assert metadata["title"] == "2101.00075v1.pdf"
+
+    def test_no_text_pdf_raises_scanned_error(self):
+        data = _make_no_text_pdf()
+        with pytest.raises(ValueError, match=r"no embedded text"):
+            traf_mod._extract_pdf_text(data, PDF_URL)
+
+    def test_pymupdf_missing_raises_lookup_error(self, monkeypatch):
+        # Simulate a checkout without PyMuPDF: _load_pymupdf raises ImportError.
+        monkeypatch.setattr(
+            traf_mod, "_load_pymupdf",
+            lambda: (_ for _ in ()).throw(ImportError("no pymupdf")),
+        )
+        data = _make_text_pdf()
+        with pytest.raises(LookupError, match="pymupdf not installed"):
+            traf_mod._extract_pdf_text(data, PDF_URL)
+
+    def test_extract_pdf_end_to_end_contract(self, monkeypatch):
+        # Hermetic: fake network returns an in-test PDF; real PyMuPDF runs.
+        monkeypatch.setattr(traf_mod, "is_safe_url", lambda _url: True)
+        monkeypatch.setattr(traf_mod, "check_website_access", lambda _url: None)
+        monkeypatch.setattr(traf_mod, "_fetch_url", lambda _url: _make_text_pdf(title="E2E Paper"))
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+        results = _run(TrafilaturaProvider().extract([PDF_URL]))
+        assert len(results) == 1
+        item = results[0]
+        for key in ("url", "title", "content", "raw_content", "metadata"):
+            assert key in item, f"missing contract key: {key}"
+        assert "error" not in item
+        assert "Hello PDF world." in item["content"]
+        assert item["metadata"]["pdf"] is True
+        assert item["metadata"]["page_count"] == 1
+
+    def test_extract_scanned_pdf_error_item(self, monkeypatch):
+        monkeypatch.setattr(traf_mod, "is_safe_url", lambda _url: True)
+        monkeypatch.setattr(traf_mod, "check_website_access", lambda _url: None)
+        monkeypatch.setattr(traf_mod, "_fetch_url", lambda _url: _make_no_text_pdf())
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+        results = _run(TrafilaturaProvider().extract([PDF_URL]))
+        assert len(results) == 1
+        item = results[0]
+        assert "error" in item
+        assert "no embedded text (scanned/image-only PDF; OCR not supported by web_extract)" in item["error"]
+
+    def test_html_not_routed_to_pdf_branch(self, monkeypatch):
+        # HTML fixture must keep flowing to trafilatura, never the PDF helper.
+        pdf_calls = {"n": 0}
+        real_pdf = traf_mod._extract_pdf_text
+
+        def spy_pdf(data, url):
+            pdf_calls["n"] += 1
+            return real_pdf(data, url)
+
+        self._monkeypatch_html(monkeypatch, spy_pdf)
+        results = _run(TrafilaturaProvider().extract([FIXTURE_URL]))
+        assert len(results) == 1
+        assert "error" not in results[0]
+        assert "Web scraping is the automated extraction of data" in results[0]["content"]
+        assert pdf_calls["n"] == 0  # PDF path never taken for HTML
+
+    @staticmethod
+    def _monkeypatch_html(monkeypatch, pdf_fn):
+        monkeypatch.setattr(traf_mod, "is_safe_url", lambda _url: True)
+        monkeypatch.setattr(traf_mod, "check_website_access", lambda _url: None)
+        monkeypatch.setattr(traf_mod, "_fetch_url", lambda _url: FIXTURE_HTML)
+        monkeypatch.setattr(traf_mod, "_extract_pdf_text", pdf_fn)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
