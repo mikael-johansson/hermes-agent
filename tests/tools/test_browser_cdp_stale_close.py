@@ -19,6 +19,7 @@ import json
 import threading
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -224,6 +225,11 @@ _RESTORED_CLEANUP_RUNNING = False
 _RESTORED_THREAD = None
 
 
+def _reset_age_cache():
+    browser_tool._page_ages_cache = {}
+    browser_tool._page_ages_cache_loaded = False
+
+
 def _restore_globals():
     browser_tool._active_sessions.clear()
     browser_tool._active_sessions.update(_RESTORED_ACTIVE)
@@ -232,12 +238,20 @@ def _restore_globals():
     browser_tool._cdp_startup_sweep_done = _RESTORED_SWEEP_FLAG
     browser_tool._cleanup_running = _RESTORED_CLEANUP_RUNNING
     browser_tool._cleanup_thread = _RESTORED_THREAD
+    _reset_age_cache()
 
 
 @pytest.fixture(autouse=True)
-def _isolate_state():
+def _isolate_state(tmp_path, monkeypatch):
     global _RESTORED_ACTIVE, _RESTORED_ACTIVITY, _RESTORED_SWEEP_FLAG
     global _RESTORED_CLEANUP_RUNNING, _RESTORED_THREAD
+    # Point the persistent page-age map at a scratch file so these tests never
+    # read/write the real ~/.hermes/browser-page-ages.json, and start with an
+    # empty (tracked) age map: in the new policy, unknown-age pages are never
+    # TTL-reaped and unknown-age = newest for max-tabs, so a clean map means
+    # "nothing is over-TTL, keep the newest N".
+    monkeypatch.setenv("HERMES_BROWSER_AGE_FILE", str(tmp_path / "browser-page-ages.json"))
+    _reset_age_cache()
     _RESTORED_ACTIVE = dict(browser_tool._active_sessions)
     _RESTORED_ACTIVITY = dict(browser_tool._session_last_activity)
     _RESTORED_SWEEP_FLAG = browser_tool._cdp_startup_sweep_done
@@ -334,34 +348,66 @@ class TestCdpWsUrlFor:
 # ============================================================================
 
 class TestCleanupSingleCdpSession:
+    def _seed_ages(self, now):
+        """Pre-seed the persistent age map so the stale pages are over-TTL and
+        the active page is fresh (TTL = default 86400s)."""
+        browser_tool._update_page_ages(
+            [
+                "https://stale.example/page1",
+                "https://stale.example/page2",
+                "https://active.example/dash",
+            ],
+            now=now - 100000,  # record first-seen in the past
+        )
+        # Overwrite the active page to look fresh.
+        ages = browser_tool._read_page_ages()
+        ages["https://active.example/dash"] = now - 10
+        browser_tool._write_page_ages(ages)
+
     def test_cdp_session_closes_stale_targets_via_raw_cdp(self, mock_cdp):
+        now = time_now()
+        self._seed_ages(now)
         browser_tool._active_sessions["task-cdp"] = {
             "session_name": "cdp_mock",
             "bb_session_id": None,
             "cdp_url": mock_cdp.ws_url,
             "features": {"cdp_override": True},
         }
-        browser_tool._session_last_activity["task-cdp"] = time_now()
+        # INACTIVE session (activity entry present) -> the reaper protects
+        # nothing, so over-TTL pages (including any the session last showed)
+        # become normal candidates.
+        browser_tool._session_last_activity["task-cdp"] = now
 
         with unittest.mock.patch("tools.browser_tool._run_browser_command") as mock_run:
             browser_tool._cleanup_single_browser_session("task-cdp")
 
         # The hanging/no-op agent-browser close must NOT run for cdp_url
-        # sessions; the raw-CDP path closes the stale pages instead.
+        # sessions; the raw-CDP path closes the over-TTL pages instead.
         mock_run.assert_not_called()
         # Bookkeeping removed.
         assert "task-cdp" not in browser_tool._active_sessions
         assert "task-cdp" not in browser_tool._session_last_activity
-        # No last_url recorded → no protection: every real page is stale.
-        # Blank page + iframe survive (assert by id — the iframe shares the
-        # active page's URL); the endpoint stays up.
+        # Over-TTL pages closed; the fresh active page + blank + iframe survive
+        # (assert by id — the iframe shares the active page's URL).
         remaining = {t["id"] for t in mock_cdp.targets}
-        assert remaining == {"blank-1", "iframe-1", "worker-1"}
-        assert mock_cdp.closed_ids == ["stale-1", "stale-2", "active-1"]
+        assert remaining == {"active-1", "blank-1", "iframe-1", "worker-1"}
+        assert sorted(mock_cdp.closed_ids) == ["stale-1", "stale-2"]
         assert mock_cdp.connections >= 1
         assert not mock_cdp.loop_exceptions
 
-    def test_cdp_session_protects_its_last_url(self, mock_cdp):
+    def test_cdp_session_expiry_replacement_protects_its_last_url(self, mock_cdp):
+        now = time_now()
+        # Seed ALL pages (incl. the active one) over-TTL so that ONLY the
+        # protection (protect_last_url=True) can save the active page — a
+        # faithful test of the expiry-replacement protection, not of TTL.
+        browser_tool._update_page_ages(
+            [
+                "https://stale.example/page1",
+                "https://stale.example/page2",
+                "https://active.example/dash",
+            ],
+            now=now - 100000,
+        )
         browser_tool._active_sessions["task-cdp"] = {
             "session_name": "cdp_mock",
             "bb_session_id": None,
@@ -369,15 +415,19 @@ class TestCleanupSingleCdpSession:
             "features": {"cdp_override": True},
             "last_url": "https://active.example/dash",
         }
-        browser_tool._session_last_activity["task-cdp"] = time_now()
+        # EXPIRY-REPLACEMENT path: the session is being renewed, so the
+        # in-use last_url must be protected from the reaping plan.
+        assert "task-cdp" not in browser_tool._session_last_activity
 
         with unittest.mock.patch("tools.browser_tool._run_browser_command") as mock_run:
-            browser_tool._cleanup_single_browser_session("task-cdp")
+            browser_tool._cleanup_single_browser_session("task-cdp", protect_last_url=True)
 
         mock_run.assert_not_called()
+        # The protected last_url (active) survives even though it is over-TTL;
+        # the unprotected over-TTL stale pages are closed.
         urls = {t["url"] for t in mock_cdp.targets}
         assert "https://active.example/dash" in urls
-        assert mock_cdp.closed_ids == ["stale-1", "stale-2"]
+        assert sorted(mock_cdp.closed_ids) == ["stale-1", "stale-2"]
 
     def test_non_cdp_session_still_uses_agent_browser_close(self):
         browser_tool._active_sessions["task-local"] = {
@@ -406,8 +456,23 @@ def time_now():
 # ============================================================================
 
 class TestSweepStaleCdpTargets:
+    def _seed_ages(self, now):
+        """Pre-seed the persistent age map: stale pages over-TTL, active fresh."""
+        browser_tool._update_page_ages(
+            [
+                "https://stale.example/page1",
+                "https://stale.example/page2",
+                "https://active.example/dash",
+            ],
+            now=now - 100000,
+        )
+        ages = browser_tool._read_page_ages()
+        ages["https://active.example/dash"] = now - 10
+        browser_tool._write_page_ages(ages)
+
     def test_sweep_closes_stale_and_protects_active_session(self, mock_cdp, monkeypatch):
         monkeypatch.setenv("BROWSER_CDP_URL", mock_cdp.http_url)
+        self._seed_ages(time_now())
         # Active session in this process (the very one that started the
         # cleanup thread) — its live page must survive the sweep.
         browser_tool._active_sessions["task-sweep"] = {
@@ -425,7 +490,7 @@ class TestSweepStaleCdpTargets:
         assert "https://stale.example/page2" not in urls
         assert "https://active.example/dash" in urls
         assert "about:blank" in urls
-        assert mock_cdp.closed_ids == ["stale-1", "stale-2"]
+        assert sorted(mock_cdp.closed_ids) == ["stale-1", "stale-2"]
 
     def test_sweep_no_op_without_cdp_override(self, monkeypatch):
         monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
@@ -442,6 +507,7 @@ class TestSweepStaleCdpTargets:
 
     def test_cleanup_thread_runs_sweep_once_on_startup(self, mock_cdp, monkeypatch):
         monkeypatch.setenv("BROWSER_CDP_URL", mock_cdp.http_url)
+        self._seed_ages(time_now())
         browser_tool._cdp_startup_sweep_done = False
         browser_tool._cleanup_running = True
         # The active session's page is recorded as last_url — the sweep must
@@ -467,7 +533,7 @@ class TestSweepStaleCdpTargets:
 
         # One-time sweep ran with its 5 s grace sleep; stale pages closed.
         assert any(c.args and c.args[0] == 5 for c in mock_sleep.call_args_list)
-        assert mock_cdp.closed_ids == ["stale-1", "stale-2"]
+        assert sorted(mock_cdp.closed_ids) == ["stale-1", "stale-2"]
         assert browser_tool._cdp_startup_sweep_done is True
 
         # Second invocation must not re-sweep (flag already set).
@@ -478,4 +544,4 @@ class TestSweepStaleCdpTargets:
         with unittest.mock.patch("tools.browser_tool.time.sleep", mock_sleep), \
                 unittest.mock.patch("tools.browser_tool._reap_orphaned_browser_sessions"):
             browser_tool._browser_cleanup_thread_worker()
-        assert mock_cdp.closed_ids == ["stale-1", "stale-2"]
+        assert sorted(mock_cdp.closed_ids) == ["stale-1", "stale-2"]

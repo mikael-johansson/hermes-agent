@@ -634,25 +634,31 @@ def _close_stale_cdp_targets(
     ws_url: str,
     *,
     protect_urls: Tuple[str, ...] = (),
+    close_ids: Optional[Tuple[str, ...]] = None,
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
-    """Close stale page targets on a browser-level CDP websocket.
+    """Close page targets on a browser-level CDP websocket.
 
     Verified safe recipe (b_diag.md): connect with the ``websockets`` library
     (which sends NO Origin header by default — do NOT pass
     websocket-client's ``suppress_origin`` kwarg here, it raises TypeError on
     ``websockets``), send ``Target.getTargets``, then ``Target.closeTarget``
-    per stale page.  The browser process itself is never touched.
+    per page.  The browser process itself is never touched.
 
     Args:
         ws_url: Browser-level websocket (``ws://.../devtools/browser/<id>``).
         protect_urls: URLs (exact or prefix in either direction) to keep —
             e.g. the last URL of a session whose bookkeeping we are about to
             drop, so an active page is not yanked out from under its task.
+        close_ids: When given (a plan from ``_plan_tab_reaping``), close
+            EXACTLY these target ids (defensively intersected with the live
+            target list).  When ``None``, fall back to the legacy rule:
+            close every ``page`` target with a real, non-protected URL.
         timeout: Per-CDP-message timeout in seconds.
 
     Returns:
-        ``{"ws_url", "total", "stale", "closed", "failed", "errors"}``.
+        ``{"ws_url", "total", "stale", "closed", "failed", "errors"}``
+        (``stale`` = number of targets the plan selected for closing).
         Never raises — cleanup paths must stay best-effort.
     """
     summary: Dict[str, Any] = {
@@ -665,6 +671,10 @@ def _close_stale_cdp_targets(
     }
     if not ws_url:
         return summary
+
+    close_id_set = None
+    if close_ids is not None:
+        close_id_set = {str(i) for i in close_ids if i}
 
     def _is_protected(url: str) -> bool:
         url = (url or "").strip()
@@ -686,10 +696,21 @@ def _close_stale_cdp_targets(
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout))
                 targets = (resp.get("result") or {}).get("targetInfos") or []
                 summary["total"] = len(targets)
-                stale = [
-                    t for t in targets
-                    if _is_stale_cdp_target(t) and not _is_protected(t.get("url", ""))
-                ]
+                if close_id_set is not None:
+                    # Plan-driven close: the shared policy (_plan_tab_reaping)
+                    # already applied the TTL / max-tabs / protection rules;
+                    # just close exactly what it selected.  Defensive
+                    # intersect with the live targets in case a plan id
+                    # vanished between planning and closing.
+                    stale = [
+                        t for t in targets
+                        if t.get("id") and str(t["id"]) in close_id_set
+                    ]
+                else:
+                    stale = [
+                        t for t in targets
+                        if _is_stale_cdp_target(t) and not _is_protected(t.get("url", ""))
+                    ]
                 summary["stale"] = len(stale)
                 for idx, t in enumerate(stale):
                     msg_id = 2 + idx
@@ -719,8 +740,39 @@ def _close_stale_cdp_targets(
     return summary
 
 
+def _get_cdp_targets(ws_url: str, timeout: float = 15.0) -> List[Dict[str, Any]]:
+    """Enumerate targets over a browser-level CDP websocket.
+
+    One-shot ``Target.getTargets`` fetch used by the tab-reaping chokepoints
+    (startup sweep + inactivity reaper) to plan closes BEFORE opening the
+    close connection.  Never raises — a dead endpoint yields ``[]``.
+    """
+    if not ws_url:
+        return []
+
+    import asyncio
+
+    async def _run() -> List[Dict[str, Any]]:
+        import websockets
+
+        async with websockets.connect(ws_url, max_size=2 ** 22, open_timeout=10) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+            return (resp.get("result") or {}).get("targetInfos") or []
+
+    try:
+        return list(asyncio.run(_run()))
+    except Exception as exc:
+        logger.debug(
+            "CDP cleanup: Target.getTargets on %s failed: %s",
+            _sanitize_url_for_logs(ws_url),
+            _sanitize_url_for_logs(exc),
+        )
+        return []
+
+
 def _sweep_stale_cdp_targets() -> None:
-    """Startup sweep: close stale pages on the configured adopted CDP endpoint.
+    """Startup sweep: reap page tabs on the adopted CDP endpoint per policy.
 
     In-memory session bookkeeping (``_active_sessions`` /
     ``_session_last_activity``) is lost on every gateway/container restart,
@@ -731,8 +783,14 @@ def _sweep_stale_cdp_targets() -> None:
     Runs once per process lifetime (invoked from the inactivity cleanup
     thread's startup, after a grace period so a session created by the call
     that started the thread records its ``last_url`` first).  Best-effort:
-    any failure is logged and swallowed.  Targets matching this process's
-    active sessions' last URLs are protected.
+    any failure is logged and swallowed.
+
+    Reaping policy (shared chokepoint ``_plan_tab_reaping``): at startup
+    close ONLY pages that violate ``browser.tab_ttl_seconds`` (tracked age
+    from the persistent age map) or that push the browser past
+    ``browser.max_tabs`` — never close recent/active tabs of other live
+    sessions.  Targets matching this process's active sessions' last URLs
+    are protected from both rules.
     """
     try:
         raw = _get_cdp_override_raw()
@@ -760,18 +818,52 @@ def _sweep_stale_cdp_targets() -> None:
     except Exception:
         pass
 
-    summary = _close_stale_cdp_targets(ws_url, protect_urls=tuple(protect))
-    if summary["stale"]:
-        logger.info(
-            "Startup CDP sweep on %s: %d targets, closed %d stale page(s) (%d failed)",
-            _sanitize_url_for_logs(raw),
-            summary["total"],
-            summary["closed"],
-            summary["failed"],
-        )
-    elif summary["errors"]:
+    targets = _get_cdp_targets(ws_url)
+    if not targets:
         logger.debug(
-            "Startup CDP sweep on %s skipped with errors: %s",
+            "Startup CDP sweep on %s: endpoint unreachable; skipping",
+            _sanitize_url_for_logs(raw),
+        )
+        return
+
+    # Refresh the persistent age map (survives process/container restarts):
+    # record first-sightings for new pages, drop URLs no longer present.
+    ages = _update_page_ages(
+        [t.get("url", "") for t in targets if _is_stale_cdp_target(t)]
+    )
+    max_tabs, ttl_seconds = _get_tab_reaping_policy()
+    plan = _plan_tab_reaping(
+        targets,
+        max_tabs=max_tabs,
+        ttl_seconds=ttl_seconds,
+        ages=ages,
+        protect_urls=tuple(protect),
+    )
+    if not plan:
+        logger.debug(
+            "Startup CDP sweep on %s: %d targets, nothing to reap "
+            "(max_tabs=%d, ttl=%ds)",
+            _sanitize_url_for_logs(raw),
+            len(targets),
+            max_tabs,
+            ttl_seconds,
+        )
+        return
+
+    summary = _close_stale_cdp_targets(ws_url, close_ids=tuple(plan))
+    logger.info(
+        "Startup CDP sweep on %s: %d targets, closed %d page(s) (%d failed) "
+        "[max_tabs=%d, ttl=%ds]",
+        _sanitize_url_for_logs(raw),
+        summary["total"],
+        summary["closed"],
+        summary["failed"],
+        max_tabs,
+        ttl_seconds,
+    )
+    if summary["errors"]:
+        logger.debug(
+            "Startup CDP sweep on %s errors: %s",
             _sanitize_url_for_logs(raw),
             summary["errors"],
         )
@@ -1783,6 +1875,340 @@ BROWSER_SESSION_INACTIVITY_TIMEOUT = _get_session_inactivity_timeout()
 # Track last activity time per session
 _session_last_activity: Dict[str, float] = {}
 
+# =============================================================================
+# Browser tab-reaping policy (adopted CDP browsers)
+# =============================================================================
+#
+# Two policy knobs, read the same way ``browser.inactivity_timeout`` is (see
+# ``_get_session_inactivity_timeout``):
+#
+#   browser.max_tabs         (default 20)    cap on tracked page tabs; trim
+#                                            the OLDEST pages when over.
+#   browser.tab_ttl_seconds  (default 86400) close a page once its tracked
+#                                            age (seconds since first
+#                                            sighting) exceeds this.
+#
+# ``0`` (or any non-positive / invalid value) DISABLES that knob (fail closed:
+# the policy simply does not close anything for it, never crashes).  The
+# runtime reader (``_get_tab_reaping_policy``) is what the two chokepoints
+# (the startup sweep + the inactivity reaper's adopted-CDP branch) consume via
+# the single shared function ``_plan_tab_reaping`` — stale-target logic is
+# not duplicated anywhere.
+#
+# Age tracking: CDP targets carry no creation timestamp, so a small on-disk
+# JSON map ``url -> first-seen epoch`` (``~/.hermes/browser-page-ages.json``,
+# override with ``HERMES_BROWSER_AGE_FILE``) persists first-sighting times
+# across process/container restarts.  ``_update_page_ages`` records new
+# URLs, refreshes nothing, drops URLs no longer present, and caps entry
+# count.  A corrupt/missing file starts fresh.  A page with no tracked age
+# (just created, never swept) is "unknown age" and is NEVER TTL-reaped.
+
+DEFAULT_BROWSER_MAX_TABS = 20
+DEFAULT_BROWSER_TAB_TTL_SECONDS = 86400
+
+# Cap on tracked URL entries so the map cannot grow unbounded across
+# long-lived container browsers (oldest entries are dropped first).
+_PAGE_AGES_MAX_ENTRIES = 512
+
+# The in-memory cache of the on-disk age map.  Loaded lazily on first use
+# (and after every write) so we avoid a disk read on every sweep/reap pass.
+_page_ages_cache: Dict[str, float] = {}
+_page_ages_cache_loaded = False
+# Serializes age-file read/write against concurrent cleanup threads
+# (subagents run concurrently via ThreadPoolExecutor).
+_page_ages_lock = threading.Lock()
+
+
+def _get_browser_page_ages_file() -> Path:
+    """Return the path of the on-disk page-age map.
+
+    ``HERMES_BROWSER_AGE_FILE`` overrides the location (tests use this);
+    default lives in ``~/.hermes/`` so it sits with the rest of agent state
+    (and is NOT swept by the webui ``HERMES_WEBUI_STATE_DIR`` layout).
+    """
+    override = os.environ.get("HERMES_BROWSER_AGE_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path(get_hermes_home()) / "browser-page-ages.json"
+
+
+def _read_page_ages() -> Dict[str, float]:
+    """Load the on-disk ``url -> first-seen epoch`` map (lazy + cached).
+
+    Tolerant of a corrupt/missing file: returns an empty dict on any
+    problem (start fresh).  Returns a shallow copy so callers can mutate
+    safely.
+    """
+    global _page_ages_cache, _page_ages_cache_loaded
+    with _page_ages_lock:
+        if _page_ages_cache_loaded:
+            return dict(_page_ages_cache)
+        ages: Dict[str, float] = {}
+        try:
+            path = _get_browser_page_ages_file()
+            if path.is_file():
+                raw = json.loads(path.read_text("utf-8"))
+                if isinstance(raw, dict):
+                    for url, ts in raw.items():
+                        try:
+                            ts_f = float(ts)
+                        except (TypeError, ValueError):
+                            continue
+                        if ts_f > 0:
+                            ages[str(url)] = ts_f
+        except Exception as exc:
+            logger.debug("Page-age file read failed (%s); starting fresh", exc)
+        _page_ages_cache = ages
+        _page_ages_cache_loaded = True
+        return dict(ages)
+
+
+def _write_page_ages(ages: Dict[str, float]) -> None:
+    """Atomically persist ``url -> first-seen epoch``.
+
+    Creates the parent directory if missing.  Best-effort: a failure is
+    logged and swallowed — age tracking is an optimization, never a
+    correctness gate, so it must never break the cleanup path.
+    """
+    global _page_ages_cache, _page_ages_cache_loaded
+    with _page_ages_lock:
+        # Cap entry count: if over the cap, keep the most recent
+        # (highest epoch) entries — the oldest are the least useful.
+        if len(ages) > _PAGE_AGES_MAX_ENTRIES:
+            ordered = sorted(ages.items(), key=lambda kv: kv[1], reverse=True)
+            ages = dict(ordered[:_PAGE_AGES_MAX_ENTRIES])
+        _page_ages_cache = dict(ages)
+        _page_ages_cache_loaded = True
+        try:
+            path = _get_browser_page_ages_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic write: temp file in the same dir, then rename over.
+            fd, tmp = tempfile.mkstemp(
+                prefix=".browser-page-ages-", suffix=".tmp", dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(ages, fh)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            logger.debug("Page-age file write failed (%s)", exc)
+
+
+def _update_page_ages(present_urls, *, now: Optional[float] = None) -> Dict[str, float]:
+    """Refresh the age map against the set of currently-present page URLs.
+
+    Records a first-sighting for any URL not yet tracked (keeps the
+    existing first-seen epoch for URLs already tracked — that is what makes
+    the TTL a true "age" rather than a reset-on-every-sweep timer), and
+    drops entries for URLs no longer present.  Returns the updated map.
+
+    ``present_urls`` may be an iterable of URLs; blank/``about:blank`` URLs
+    are ignored (they are never reaped, so tracking them is noise).
+    """
+    now = time.time() if now is None else float(now)
+    ages = _read_page_ages()
+    changed = False
+    seen = set()
+    for url in present_urls:
+        u = str(url or "").strip()
+        if not u or u == "about:blank":
+            continue
+        seen.add(u)
+        if u not in ages:
+            ages[u] = now
+            changed = True
+    # Drop entries no longer present.
+    for u in list(ages.keys()):
+        if u not in seen:
+            del ages[u]
+            changed = True
+    if changed:
+        _write_page_ages(ages)
+        # _write_page_ages may have capped the entry count; return what was
+        # actually persisted so the caller's view matches the file.
+        return dict(_page_ages_cache)
+    return ages
+
+
+def _get_tab_reaping_policy() -> Tuple[int, int]:
+    """Read ``browser.max_tabs`` + ``browser.tab_ttl_seconds`` from config.
+
+    Returns a ``(max_tabs, ttl_seconds)`` tuple.  Mirrors the
+    ``_get_session_inactivity_timeout`` pattern: ``read_raw_config``
+    (authoritative config.yaml) > ``DEFAULT_CONFIG`` > the module constant.
+    Invalid / non-positive values fall back to the default for that knob
+    (fail closed = policy disabled for that knob, never crash).
+    """
+    max_tabs = DEFAULT_BROWSER_MAX_TABS
+    ttl = DEFAULT_BROWSER_TAB_TTL_SECONDS
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        max_raw = cfg_get(cfg, "browser", "max_tabs")
+        if max_raw is not None:
+            try:
+                v = int(max_raw)
+                if v > 0:
+                    max_tabs = v
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Invalid browser.max_tabs=%r; using default %d", max_raw, max_tabs,
+                )
+        ttl_raw = cfg_get(cfg, "browser", "tab_ttl_seconds")
+        if ttl_raw is not None:
+            try:
+                v = int(ttl_raw)
+                if v > 0:
+                    ttl = v
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Invalid browser.tab_ttl_seconds=%r; using default %d",
+                    ttl_raw, ttl,
+                )
+    except Exception as e:
+        logger.debug("Could not read tab-reaping policy from config: %s", e)
+    return max_tabs, ttl
+
+
+def _plan_tab_reaping(
+    targets: List[Dict[str, Any]],
+    *,
+    max_tabs: Optional[int] = None,
+    ttl_seconds: Optional[int] = None,
+    ages: Optional[Dict[str, float]] = None,
+    protect_urls: Tuple[str, ...] = (),
+    now: Optional[float] = None,
+) -> List[str]:
+    """Decide which page targets to close, per the shared tab-reaping policy.
+
+    Given the list of CDP ``targetInfo`` dicts, return the list of target
+    **ids** to close.  This is the single chokepoint both reaping call sites
+    (the startup sweep + the inactivity reaper's adopted-CDP branch) use, so
+    the stale-target logic is never duplicated.
+
+    Rules (the contract tests in ``tests/tools/test_browser_tab_reaping.py``
+    prove these):
+
+      * Only ``page`` targets with a non-blank URL are ever candidates
+        (workers/iframes/browser_ui die with their parent page — never
+        counted, never closed).
+      * **TTL rule** — when ``ttl_seconds`` is positive, a page whose tracked
+        age (``now - ages[url]``) exceeds it is closed, EXCEPT URLs in
+        ``protect_urls`` and EXCEPT pages with no tracked age (unknown age is
+        never TTL-reaped — a freshly created page must not die on its first
+        sweep).
+      * **Max-tabs rule** — when ``max_tabs`` is positive, after TTL reaps,
+        the TOTAL number of remaining page tabs (protected included — a
+        protected page still occupies a tab slot) must be at or under the
+        limit.  If it exceeds the limit, close the OLDEST *non-protected*
+        pages (by tracked age; unknown ages count as newest) until the total
+        is at or under the limit.
+      * ``protect_urls`` pages are NEVER closed by either rule (exact or
+        prefix match, in either direction) — but they DO count toward the
+        max-tabs total.
+      * ``max_tabs`` <= 0 / None => max-tabs rule disabled;
+        ``ttl_seconds`` <= 0 / None => TTL rule disabled.
+
+    Never raises on a malformed target/age entry (a bad entry is skipped,
+    the rest are still planned).
+    """
+    now = time.time() if now is None else float(now)
+    ages = ages if ages is not None else {}
+
+    def _is_protected(url: str) -> bool:
+        u = (url or "").strip()
+        if not u or u == "about:blank":
+            return False
+        return any(
+            p and (u == p or u.startswith(p) or p.startswith(u))
+            for p in protect_urls
+        )
+
+    # 1. Candidate pages only (real, non-blank URLs, page type).
+    candidates: List[Dict[str, Any]] = [
+        t for t in targets
+        if isinstance(t, dict)
+        and t.get("type") == "page"
+        and t.get("id")
+        and _is_stale_cdp_target(t)
+        and not _is_protected(t.get("url", ""))
+    ]
+
+    def _age_of(t: Dict[str, Any]) -> Optional[float]:
+        url = str(t.get("url") or "").strip()
+        if not url:
+            return None
+        raw = ages.get(url)
+        if raw is None:
+            return None
+        try:
+            return now - float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    to_close: List[str] = []
+
+    # 2. TTL rule (over candidates, i.e. non-protected pages).
+    if ttl_seconds is not None and int(ttl_seconds) > 0:
+        ttl = int(ttl_seconds)
+        survivors: List[Dict[str, Any]] = []
+        for t in candidates:
+            age = _age_of(t)
+            if age is not None and age > ttl:
+                to_close.append(t["id"])
+            else:
+                survivors.append(t)
+        candidates = survivors
+
+    # 3. Max-tabs rule.  Protected pages survive the TTL pass unchanged and
+    #    are never closed — but they DO count toward the total tab count
+    #    (a protected page still occupies a tab slot).  We therefore count
+    #    the protected survivors too, then close the oldest NON-protected
+    #    pages until the total is at or under the cap.
+    if max_tabs is not None and int(max_tabs) > 0:
+        cap = int(max_tabs)
+        protected_survivors: List[Dict[str, Any]] = [
+            t for t in targets
+            if isinstance(t, dict)
+            and t.get("type") == "page"
+            and t.get("id")
+            and _is_stale_cdp_target(t)
+            and _is_protected(t.get("url", ""))
+        ]
+        # Dedupe by id in case a target matched protection twice (shouldn't
+        # happen, but be defensive).
+        seen_ids = set()
+        deduped_protected: List[Dict[str, Any]] = []
+        for t in protected_survivors:
+            if t["id"] not in seen_ids:
+                seen_ids.add(t["id"])
+                deduped_protected.append(t)
+        protected_survivors = deduped_protected
+
+        total = len(candidates) + len(protected_survivors)
+        if total > cap:
+            # Need to remove (total - cap) pages, all non-protected.
+            need_to_remove = total - cap
+            # Sort non-protected survivors OLDEST first (largest age;
+            # unknown age is NEWEST = -inf so it sorts last).
+            candidates.sort(
+                key=lambda t: _age_of(t) if _age_of(t) is not None else float("-inf"),
+                reverse=True,
+            )
+            # Close up to ``need_to_remove`` oldest (cannot exceed what we
+            # actually have — protected pages absorb the difference).
+            to_remove = min(need_to_remove, len(candidates))
+            to_close.extend(t["id"] for t in candidates[:to_remove])
+
+    return to_close
+
+
 # Background cleanup thread state
 _cleanup_thread = None
 _cleanup_running = False
@@ -2439,7 +2865,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
             "Replacing expired cloud browser session for task %s",
             task_id,
         )
-        _cleanup_single_browser_session(task_id)
+        # Expiry-replacement: the session is being *renewed* — the page it was
+        # showing is still in use by this flow, so protect its last_url (the
+        # inactivity reaper, which reaps idle sessions, leaves this False so
+        # an idle page becomes a normal reaping candidate).
+        _cleanup_single_browser_session(task_id, protect_last_url=True)
         # Cleanup removes the activity entry. The replacement session must be
         # tracked by the inactivity reaper just like an initial session.
         _update_session_activity(task_id)
@@ -4847,8 +5277,17 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         _last_active_session_key.pop(bare_task_id, None)
 
 
-def _cleanup_single_browser_session(task_id: str) -> None:
-    """Internal: reap a single browser session by its exact session key."""
+def _cleanup_single_browser_session(
+    task_id: str, *, protect_last_url: bool = False
+) -> None:
+    """Internal: reap a single browser session by its exact session key.
+
+    ``protect_last_url`` (adopted-CDP sessions only): when True the session's
+    own ``last_url`` is kept out of the reaping plan.  Set True by the
+    expiry-replacement path (the in-use page must survive); leave False (the
+    default) for the inactivity reaper + task-completion, where the page is
+    idle/done and must become a normal reaping candidate.
+    """
     # Stop the CDP supervisor for this task FIRST so we close our WebSocket
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)
@@ -4893,14 +5332,25 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             # browser is owned by something external (e.g. the
             # hermes-browser-box container, Chromium = PID 1) and
             # `agent-browser --cdp <url> close` is a proven hang + no-op for
-            # it (b_diag.md).  Close the session's targets over raw CDP
-            # instead: enumerate Target.getTargets on the browser websocket
-            # and Target.closeTarget the stale pages.  Protect the page the
-            # session last navigated to — for a *still-active* session
-            # (cleanup triggered by expiry replacement, not inactivity) that
-            # page is in use and must survive; for an inactive session the
-            # last_url heuristic is a conservative "don't yank the one page
-            # we know about" guard while the sweep/reaper handle the rest.
+            # it (b_diag.md).  Close targets over raw CDP instead, driven by
+            # the SHARED tab-reaping policy (_plan_tab_reaping): enumerate
+            # Target.getTargets, refresh the persistent page-age map, then
+            # close exactly what the policy selects (TTL-violating pages +
+            # oldest-first trim down to browser.max_tabs).
+            #
+            # Protection depends on WHY this cleanup ran (the caller decides —
+            # the two triggers are NOT distinguishable from inside this
+            # function, because ``_get_session_info`` calls
+            # ``_update_session_activity`` *before* the expiry-replacement
+            # cleanup, so the activity entry is present in BOTH paths):
+            #   * inactivity reaper / task-completion: the page is idle/done
+            #     — protect NOTHING, so the session's own last_url becomes a
+            #     normal candidate and is closed as soon as it violates the
+            #     TTL / max-tabs rules.  (Before this change the reaper
+            #     protected its own last_url unconditionally and closed 0 —
+            #     verified live 2026-10-02: "41 targets, closed 0".)
+            #   * expiry-replacement: the page is in use by the replacement
+            #     flow — keep protecting its last_url (protect_last_url=True).
             cdp_url = str(session_info.get("cdp_url") or "").strip()
             if cdp_url:
                 try:
@@ -4914,19 +5364,51 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                         )
                     else:
                         last_url = str(session_info.get("last_url") or "").strip()
-                        summary = _close_stale_cdp_targets(
-                            ws_url,
-                            protect_urls=(last_url,) if last_url else (),
-                        )
-                        logger.info(
-                            "CDP cleanup for task %s on %s: %d targets, closed "
-                            "%d stale page(s) (%d failed)",
-                            task_id,
-                            _sanitize_url_for_logs(cdp_url),
-                            summary["total"],
-                            summary["closed"],
-                            summary["failed"],
-                        )
+                        if protect_last_url:
+                            # Expiry-replacement: keep protecting the session's
+                            # last page (in use by the replacement flow).
+                            protect_urls: Tuple[str, ...] = (last_url,) if last_url else ()
+                        else:
+                            # Inactivity reaper / task-completion: the page is
+                            # idle/done — protect nothing.
+                            protect_urls = ()
+                        targets = _get_cdp_targets(ws_url)
+                        if not targets:
+                            logger.debug(
+                                "CDP cleanup for task %s on %s: no targets "
+                                "(endpoint unreachable?); nothing to close",
+                                task_id, _sanitize_url_for_logs(cdp_url),
+                            )
+                        else:
+                            ages = _update_page_ages(
+                                [t.get("url", "") for t in targets
+                                 if _is_stale_cdp_target(t)]
+                            )
+                            max_tabs, ttl_seconds = _get_tab_reaping_policy()
+                            plan = _plan_tab_reaping(
+                                targets,
+                                max_tabs=max_tabs,
+                                ttl_seconds=ttl_seconds,
+                                ages=ages,
+                                protect_urls=protect_urls,
+                            )
+                            summary = _close_stale_cdp_targets(
+                                ws_url,
+                                close_ids=tuple(plan),
+                            )
+                            logger.info(
+                                "CDP cleanup for task %s on %s: %d targets, "
+                                "closed %d page(s) (%d failed) "
+                                "[max_tabs=%d, ttl=%ds%s]",
+                                task_id,
+                                _sanitize_url_for_logs(cdp_url),
+                                summary["total"],
+                                summary["closed"],
+                                summary["failed"],
+                                max_tabs,
+                                ttl_seconds,
+                                ", last_url protected" if protect_last_url else "",
+                            )
                 except Exception as e:
                     logger.warning(
                         "Raw-CDP stale-target cleanup failed for task %s: %s",
